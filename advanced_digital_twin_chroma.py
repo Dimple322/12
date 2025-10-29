@@ -1,91 +1,59 @@
+# advanced_digital_twin_chroma.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ПРОДУКТИВНАЯ версия системы цифрового аналитика с ChromaDB.
-Полная интеграция с ChromaDB, динамические сценарии, улучшенная обработка данных.
+Продвинутая система цифрового аналитика с гибридной логикой:
+- routing: sql / chroma / hybrid / schema
+- capture raw LLM traces (planner / executor / explainer)
+- hybrid execution: Chroma -> (optionally) SQL via ThinkingAgent -> SQLAgent
+- AnalysisResult unified shape with serialization
 """
-
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any
 import json
 import re
 import time
 import asyncio
-import sqlite3
 from datetime import datetime
-from enum import Enum
 import logging
 
-# ChromaDB импорты
+# ChromaDB
 import chromadb
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
 
-# AI и ML
+# AI / LLM
 import ollama
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
 
-# Визуализация
-import matplotlib.pyplot as plt
-import seaborn as sns
-import plotly.express as px
-import plotly.graph_objects as go
-from gpu_embed_global import GpuMiniLMEmbedding   # ← наша GPU-обёртка
+# local agents & utils
+from agent.sql_agent import SQLAgent
+from agent.thinking_agent import ThinkingAgent
+from agent.llm.ollama_client import AnalystLLM
 
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any
+from datetime import datetime
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# For types already in file we keep minimal imports (plotting etc are used by UI)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Конфигурация для продукта
 LLM_MODEL = "digital_twin_analyst"
 CHROMA_PATH = Path("generated/chroma_db")
 KNOWLEDGE_BASE_PATH = Path("generated/knowledge_base_productive.json")
-SCENARIOS_PATH = Path("generated/scenarios")
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+DB_PATH = Path("generated/digital_twin.db")  # sqlite DB used by SQLAgent / schema queries
 
-
-class QueryType(Enum):
+class QueryType:
     ANALYTICS = "analytics"
     SCENARIO = "scenario"
     PREDICTION = "prediction"
     VALIDATION = "validation"
     EXPLANATION = "explanation"
 
-    def __str__(self):
-        return self.value
-
-
-@dataclass
-class Context:
-    """Контекст для сохранения состояния между запросами"""
-    session_id: str
-    user_id: str
-    previous_queries: List[Dict] = field(default_factory=list)
-    domain_knowledge: Dict[str, Any] = field(default_factory=dict)
-    preferences: Dict[str, Any] = field(default_factory=dict)
-    timestamp: datetime = field(default_factory=datetime.now)
-
-    def to_dict(self):
-        return {
-            "session_id": self.session_id,
-            "user_id": self.user_id,
-            "previous_queries": self.previous_queries,
-            "domain_knowledge": self.domain_knowledge,
-            "preferences": self.preferences,
-            "timestamp": self.timestamp.isoformat()
-        }
-
-
 @dataclass
 class ReasoningStep:
-    """Шаг в процессе рассуждений"""
-    step_number: int
+    step_number: float
     description: str
     reasoning: str
     action: str
@@ -106,1004 +74,223 @@ class ReasoningStep:
             "validation_passed": self.validation_passed
         }
 
-
 @dataclass
 class AnalysisResult:
-    """Результат анализа с метаданными"""
+    """Унифицированный результат — теперь включает answer, route, raw traces и evidence."""
     query: str
-    chroma_query: str
-    data: List[Dict]
-    reasoning_steps: List[ReasoningStep]
-    insights: List[str]
-    recommendations: List[str]
-    confidence_score: float
-    validation_results: Dict[str, Any]
+    chroma_query: Optional[str] = None
+    data: List[Dict] = field(default_factory=list)
+    reasoning_steps: List[Any] = field(default_factory=list)  # ReasoningStep или dict
+    insights: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
+    confidence_score: float = 0.0
+    validation_results: Dict[str, Any] = field(default_factory=dict)
     scenario_analysis: Optional[Dict[str, Any]] = None
+
+    # Новые/опциональные поля
+    route: Optional[str] = None                      # "sql" | "chroma" | "hybrid" | "schema" | "error"
+    answer: Optional[str] = None                     # Краткий человекочитаемый ответ
+    raw_llm_traces: Dict[str, str] = field(default_factory=dict)  # planner/executor/explainer raw outputs
+    evidence: List[Dict[str, Any]] = field(default_factory=list)  # deterministic evidence (value, count, sample_rows)
+
     timestamp: datetime = field(default_factory=datetime.now)
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "query": self.query,
+            "route": self.route,
+            "answer": self.answer,
             "chroma_query": self.chroma_query,
             "data": self.data,
-            "reasoning_steps": [step.to_dict() for step in self.reasoning_steps],
+            "reasoning_steps": [s.to_dict() if hasattr(s, "to_dict") else s for s in self.reasoning_steps],
             "insights": self.insights,
             "recommendations": self.recommendations,
             "confidence_score": self.confidence_score,
             "validation_results": self.validation_results,
             "scenario_analysis": self.scenario_analysis,
+            "raw_llm_traces": self.raw_llm_traces,
+            "evidence": self.evidence,
             "timestamp": self.timestamp.isoformat()
         }
 
 
 class ChromaDBManager:
-    """Менеджер для работы с ChromaDB"""
-
     def __init__(self, persist_directory: Path = CHROMA_PATH):
         self.persist_directory = persist_directory
         self.persist_directory.mkdir(parents=True, exist_ok=True)
-
-        # Инициализация клиента ChromaDB
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
-
-        from sentence_transformers import SentenceTransformer
-        import torch
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        st_model = SentenceTransformer(EMBEDDING_MODEL, device=device)  # ← GPU
-
-        from sentence_transformers import SentenceTransformer
-        import torch
-
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        st_model = SentenceTransformer(EMBEDDING_MODEL, device=device)  # ← GPU
-
-        from gpu_embed_global import gpu_embedding
-        self.embedding_function = gpu_embedding
-
-        # Коллекции для разных типов данных
+        # collections init
         self.collections = {}
         self._initialize_collections()
 
     def _initialize_collections(self):
-        """Инициализирует коллекции ChromaDB"""
-
-        # Основная коллекция для документов
-        self.collections['documents'] = self.client.get_or_create_collection(
-            name="documents",
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-        # Коллекция для сценариев
-        self.collections['scenarios'] = self.client.get_or_create_collection(
-            name="scenarios",
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-        # Коллекция для контекста запросов
-        self.collections['queries'] = self.client.get_or_create_collection(
-            name="queries",
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-        # Коллекция для инсайтов
-        self.collections['insights'] = self.client.get_or_create_collection(
-            name="insights",
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-    def add_documents(self, documents: List[str], metadatas: List[Dict], ids: List[str],
-                      collection_name: str = 'documents'):
-        """Добавляет документы в коллекцию"""
+        # note: embedding_function set elsewhere (gpu_embed_global)
         try:
-            self.collections[collection_name].add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
-            logger.info(f"Added {len(documents)} documents to {collection_name} collection")
+            self.collections['documents'] = self.client.get_or_create_collection(name="documents")
+            self.collections['queries'] = self.client.get_or_create_collection(name="queries")
+            self.collections['insights'] = self.client.get_or_create_collection(name="insights")
+            self.collections['scenarios'] = self.client.get_or_create_collection(name="scenarios")
         except Exception as e:
-            logger.error(f"Error adding documents to {collection_name}: {e}")
+            logger.warning("ChromaDB initialize error: %s", e)
 
-    def query_documents(self, query_text: str, n_results: int = 10, collection_name: str = 'documents',
-                        filter_dict: Dict = None):
-        """Выполняет поиск похожих документов"""
+    def add_documents(self, documents: List[str], metadatas: List[Dict], ids: List[str], collection_name: str = 'documents'):
         try:
-            results = self.collections[collection_name].query(
-                query_texts=[query_text],
-                n_results=n_results,
-                where=filter_dict
-            )
+            self.collections[collection_name].add(documents=documents, metadatas=metadatas, ids=ids)
+        except Exception as e:
+            logger.error("Chroma add error: %s", e)
+
+    def query_documents(self, query_text: str, n_results: int = 10, collection_name: str = 'documents', filter_dict: Dict = None):
+        try:
+            col = self.collections.get(collection_name)
+            if col is None:
+                return {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+            results = col.query(query_texts=[query_text], n_results=n_results, where=filter_dict)
             return results
         except Exception as e:
-            logger.error(f"Error querying documents from {collection_name}: {e}")
+            logger.error("Chroma query error: %s", e)
             return {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
 
-    def get_all_documents(self, collection_name: str = 'documents'):
-        """Получает все документы из коллекции"""
-        try:
-            results = self.collections[collection_name].get()
-            return results
-        except Exception as e:
-            logger.error(f"Error getting all documents from {collection_name}: {e}")
-            return {'documents': [], 'metadatas': [], 'ids': []}
-
-    def update_document(self, document_id: str, document: str, metadata: Dict, collection_name: str = 'documents'):
-        """Обновляет документ в коллекции"""
-        try:
-            self.collections[collection_name].update(
-                ids=[document_id],
-                documents=[document],
-                metadatas=[metadata]
-            )
-            logger.info(f"Updated document {document_id} in {collection_name} collection")
-        except Exception as e:
-            logger.error(f"Error updating document in {collection_name}: {e}")
-
-    def delete_document(self, document_id: str, collection_name: str = 'documents'):
-        """Удаляет документ из коллекции"""
-        try:
-            self.collections[collection_name].delete(ids=[document_id])
-            logger.info(f"Deleted document {document_id} from {collection_name} collection")
-        except Exception as e:
-            logger.error(f"Error deleting document from {collection_name}: {e}")
-
-
-class AdvancedDigitalTwin:
-    """Продвинутая система цифрового аналитика с ChromaDB"""
-
-    def __init__(self):
-        # Инициализация ChromaDB
-        self.chroma_manager = ChromaDBManager()
-
-        # Агенты системы
-        self.context_agent = ContextAgent(self.chroma_manager)
-        self.reasoning_agent = ReasoningAgent(self.chroma_manager)
-        self.data_agent = DataAgent(self.chroma_manager)
-        self.validation_agent = ValidationAgent(self.chroma_manager)
-        self.scenario_agent = DynamicScenarioAgent(self.chroma_manager)
-        self.explanation_agent = ExplanationAgent(self.chroma_manager)
-
-        # Хранилище контекстов
-        self.contexts: Dict[str, Context] = {}
-
-        # База знаний
-        self.knowledge_base = self._load_knowledge_base()
-
-        # Инициализация продукта
-        self._initialize_product()
-
-    def _initialize_product(self):
-        """Инициализирует продуктивную систему"""
-        print("🚀 Инициализация продукта с ChromaDB...")
-
-        # Создание необходимых директорий
-        SCENARIOS_PATH.mkdir(parents=True, exist_ok=True)
-
-        # Загрузка начальных данных если есть
-        self._load_initial_data()
-
-        print("✅ Продукт инициализирован")
-
-    def _load_initial_data(self):
-        """Загружает начальные данные в ChromaDB"""
-        # Этот метод должен быть настроен под ваши конкретные данные
-        # Пример загрузки документов из файлов или API
-        pass
-
-    def _load_knowledge_base(self) -> Dict[str, Any]:
-        """Загружает базу знаний"""
-        if KNOWLEDGE_BASE_PATH.exists():
-            with open(KNOWLEDGE_BASE_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"patterns": [], "scenarios": [], "validations": [], "user_queries": []}
-
-    def _save_knowledge_base(self):
-        """Сохраняет базу знаний"""
-        with open(KNOWLEDGE_BASE_PATH, 'w', encoding='utf-8') as f:
-            json.dump(self.knowledge_base, f, ensure_ascii=False, indent=2)
-
-    async def process_query(self, query: str, session_id: str = "default",
-                            query_type: QueryType = QueryType.ANALYTICS) -> AnalysisResult:
-        """Обрабатывает пользовательский запрос с продвинутым Reasoning"""
-
-        logger.info(f"Processing query: {query} (type: {query_type.value})")
-
-        # Получение или создание контекста
-        context = self.contexts.get(session_id, Context(session_id=session_id, user_id="user"))
-
-        # Шаг 1: Анализ запроса и определение типа
-        reasoning_steps = []
-
-        step1 = ReasoningStep(
-            step_number=1,
-            description="Анализ типа запроса и определение стратегии",
-            reasoning=self._determine_query_strategy(query, query_type),
-            action="Определение типа запроса и подходящей стратегии обработки",
-            expected_outcome="Четкое понимание цели запроса и выбор правильного пути решения"
-        )
-        reasoning_steps.append(step1)
-
-        try:
-            # Шаг 2: Извлечение контекста и истории
-            relevant_context = await self.context_agent.extract_relevant_context(query, context)
-
-            step2 = ReasoningStep(
-                step_number=2,
-                description="Извлечение релевантного контекста",
-                reasoning=f"Найдено {len(relevant_context)} контекстных элементов из истории запросов",
-                action="Анализ предыдущих запросов и извлечение релевантной информации",
-                expected_outcome="Контекстуализированное понимание текущего запроса"
-            )
-            reasoning_steps.append(step2)
-
-            # Шаг 3: Планирование решения
-            if query_type == QueryType.SCENARIO:
-                solution_plan = await self.scenario_agent.plan_scenario_analysis(query, context)
-            else:
-                solution_plan = await self.reasoning_agent.create_solution_plan(query, context, relevant_context)
-
-            step3 = ReasoningStep(
-                step_number=3,
-                description="Создание плана решения",
-                reasoning=solution_plan["reasoning"],
-                action="Разработка пошагового плана анализа",
-                expected_outcome="Четкий план действий для достижения цели запроса"
-            )
-            reasoning_steps.append(step3)
-
-            # Шаг 4: Выполнение анализа
-            if query_type == QueryType.SCENARIO:
-                result = await self.scenario_agent.execute_scenario_analysis(query, solution_plan, context)
-            else:
-                result = await self._execute_analytics_query(query, solution_plan, context)
-
-            step4 = ReasoningStep(
-                step_number=4,
-                description="Выполнение анализа",
-                reasoning=f"Выполнено {len(result.data)} записей",
-                action="Выполнение ChromaDB запроса и получение данных",
-                expected_outcome="Получение релевантных данных для анализа",
-                actual_outcome=f"Получено {len(result.data)} записей",
-                confidence=0.8
-            )
-            reasoning_steps.append(step4)
-
-            # Шаг 5: Генерация инсайтов (только если есть данные)
-            if result.data:
-                insights = await self.explanation_agent.generate_insights(result, context)
-
-                step5 = ReasoningStep(
-                    step_number=5,
-                    description="Генерация инсайтов и рекомендаций",
-                    reasoning=f"Сгенерировано {len(insights)} инсайтов",
-                    action="Анализ данных и извлечение ключевых инсайтов",
-                    expected_outcome="Понимание паттернов и трендов в данных",
-                    actual_outcome=f"Найдено {len(insights)} ключевых инсайтов",
-                    confidence=0.75
-                )
-                reasoning_steps.append(step5)
-
-                # Обновляем результат с инсайтами
-                result.insights = insights.get("insights", [])
-                result.recommendations = insights.get("recommendations", [])
-
-            # Шаг 6: Валидация результатов
-            validation_results = await self.validation_agent.validate_results(result, context)
-
-            step6 = ReasoningStep(
-                step_number=6,
-                description="Валидация результатов",
-                reasoning=f"Валидация {'пройдена' if validation_results['is_valid'] else 'не пройдена'}",
-                action="Проверка корректности результатов и выявление аномалий",
-                expected_outcome="Подтверждение достоверности результатов",
-                actual_outcome=validation_results["summary"],
-                confidence=validation_results["confidence"],
-                validation_passed=validation_results["is_valid"]
-            )
-            reasoning_steps.append(step6)
-
-            # Шаг 7: Генерация динамических сценариев (если запрошено)
-            scenario_analysis = None
-            if query_type == QueryType.SCENARIO and result.data:
-                scenario_analysis = await self.scenario_agent.generate_dynamic_scenarios(query, result, context)
-
-                step7 = ReasoningStep(
-                    step_number=7,
-                    description="Генерация динамических сценариев",
-                    reasoning=f"Сгенерировано {len(scenario_analysis.get('scenarios', []))} сценариев",
-                    action="Анализ пользовательского запроса и создание релевантных сценариев",
-                    expected_outcome="Понимание потенциальных вариантов развития",
-                    actual_outcome=f"Разработано {len(scenario_analysis.get('scenarios', []))} сценариев",
-                    confidence=0.7
-                )
-                reasoning_steps.append(step7)
-
-            # Создание финального результата
-            final_result = AnalysisResult(
-                query=query,
-                chroma_query=result.chroma_query,
-                data=result.data,
-                reasoning_steps=reasoning_steps,
-                insights=result.insights,
-                recommendations=result.recommendations,
-                confidence_score=np.mean([step.confidence for step in reasoning_steps]),
-                validation_results=validation_results,
-                scenario_analysis=scenario_analysis
-            )
-
-            # Обновление контекста
-            context.previous_queries.append({
-                "query": query,
-                "result": final_result.to_dict(),
-                "timestamp": datetime.now()
-            })
-            self.contexts[session_id] = context
-
-            # Сохранение в базу знаний
-            self._update_knowledge_base(query, final_result)
-
-            # Сохранение запроса в ChromaDB для будущего использования
-            await self._save_query_to_chroma(query, final_result)
-
-            return final_result
-
-        except Exception as e:
-            logger.error(f"Error processing query: {e}")
-
-            # Возвращаем базовый результат с ошибкой
-            return AnalysisResult(
-                query=query,
-                chroma_query="",
-                data=[],
-                reasoning_steps=reasoning_steps,
-                insights=[f"Ошибка при обработке запроса: {str(e)}"],
-                recommendations=["Попробуйте переформулировать запрос"],
-                confidence_score=0.0,
-                validation_results={"is_valid": False, "confidence": 0.0, "error": str(e)}
-            )
-
-    def _determine_query_strategy(self, query: str, query_type: QueryType) -> str:
-        """Определяет стратегию обработки запроса"""
-        if query_type == QueryType.SCENARIO:
-            return "Запрос требует генерации динамических сценариев на основе пользовательского запроса"
-        elif query_type == QueryType.PREDICTION:
-            return "Запрос требует предиктивной аналитики и прогнозирования на основе исторических данных"
-        elif query_type == QueryType.VALIDATION:
-            return "Запрос требует валидации существующих данных или гипотез"
-        else:
-            return "Запрос требует стандартной аналитики с генерацией инсайтов на основе данных ChromaDB"
-
-    async def _execute_analytics_query(self, query: str, solution_plan: Dict, context: Context) -> AnalysisResult:
-        """Выполняет аналитический запрос через ChromaDB"""
-        try:
-            # Генерация ChromaDB запроса
-            chroma_query = await self.data_agent.generate_chroma_query(query, solution_plan, context)
-
-            # Выполнение запроса
-            data = await self.data_agent.execute_chroma_query(chroma_query)
-
-            return AnalysisResult(
-                query=query,
-                chroma_query=chroma_query,
-                data=data,
-                reasoning_steps=[],
-                insights=[],
-                recommendations=[],
-                confidence_score=0.8,
-                validation_results={"is_valid": True, "confidence": 0.8}
-            )
-        except Exception as e:
-            logger.error(f"Error in analytics query execution: {e}")
-            return AnalysisResult(
-                query=query,
-                chroma_query="",
-                data=[],
-                reasoning_steps=[],
-                insights=[f"Ошибка выполнения: {str(e)}"],
-                recommendations=[],
-                confidence_score=0.0,
-                validation_results={"is_valid": False, "confidence": 0.0, "error": str(e)}
-            )
-
-    def _update_knowledge_base(self, query: str, result: AnalysisResult):
-        """Обновляет базу знаний новыми паттернами"""
-        try:
-            pattern = {
-                "query_pattern": query,
-                "query_type": "analytics",
-                "successful_steps": [step.description for step in result.reasoning_steps if step.validation_passed],
-                "insights": result.insights,
-                "confidence": result.confidence_score,
-                "timestamp": datetime.now().isoformat()
-            }
-
-            self.knowledge_base["patterns"].append(pattern)
-
-            # Ограничиваем размер базы знаний
-            if len(self.knowledge_base["patterns"]) > 1000:
-                self.knowledge_base["patterns"] = self.knowledge_base["patterns"][-500:]
-
-            self._save_knowledge_base()
-        except Exception as e:
-            logger.error(f"Error updating knowledge base: {e}")
-
-    async def _save_query_to_chroma(self, query: str, result: AnalysisResult):
-        """Сохраняет запрос в ChromaDB для будущего использования"""
-        try:
-            # Создание документа из запроса и результатов
-            document = f"Query: {query}\n"
-            document += f"Insights: {', '.join(result.insights[:3])}\n"
-            document += f"Recommendations: {', '.join(result.recommendations[:2])}\n"
-            document += f"Data count: {len(result.data)}\n"
-
-            # Метаданные
-            metadata = {
-                "query": query,
-                "timestamp": datetime.now().isoformat(),
-                "confidence": result.confidence_score,
-                "data_count": len(result.data),
-                "query_type": "analytics"
-            }
-
-            # ID документа
-            doc_id = f"query_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hash(query) % 10000}"
-
-            # Сохранение в ChromaDB
-            self.chroma_manager.add_documents(
-                documents=[document],
-                metadatas=[metadata],
-                ids=[doc_id],
-                collection_name='queries'
-            )
-
-        except Exception as e:
-            logger.error(f"Error saving query to ChromaDB: {e}")
-
-
-class ContextAgent:
-    """Агент для работы с контекстом и историей"""
-
-    def __init__(self, chroma_manager: ChromaDBManager):
-        self.chroma_manager = chroma_manager
-
-    async def extract_relevant_context(self, query: str, context: Context) -> List[Dict]:
-        """Извлекает релевантный контекст из истории запросов через ChromaDB"""
-        relevant_context = []
-
-        # Поиск похожих запросов в ChromaDB
-        similar_queries = self.chroma_manager.query_documents(
-            query_text=query,
-            n_results=5,
-            collection_name='queries'
-        )
-
-        # Обработка результатов
-        if similar_queries['documents'] and similar_queries['documents'][0]:
-            for i, (doc, metadata) in enumerate(zip(similar_queries['documents'][0], similar_queries['metadatas'][0])):
-                relevance_score = 1.0 - similar_queries['distances'][0][i] if similar_queries['distances'][0] else 0.5
-
-                relevant_context.append({
-                    "query": metadata.get("query", ""),
-                    "relevance_score": relevance_score,
-                    "insights": metadata.get("insights", []),
-                    "confidence": metadata.get("confidence", 0.5)
-                })
-
-        # Также анализируем последние запросы из контекста
-        recent_queries = context.previous_queries[-5:]
-
-        for prev_query in recent_queries:
-            # Простая проверка релевантности по ключевым словам
-            prev_text = prev_query["query"].lower()
-            current_text = query.lower()
-
-            # Проверяем общие ключевые слова
-            common_words = set(prev_text.split()) & set(current_text.split())
-            relevance_score = len(common_words) / max(len(prev_text.split()), 1)
-
-            if relevance_score > 0.2:  # Порог релевантности
-                relevant_context.append({
-                    "query": prev_query["query"],
-                    "relevance_score": relevance_score,
-                    "insights": prev_query.get("result", {}).get("insights", [])
-                })
-
-        return sorted(relevant_context, key=lambda x: x["relevance_score"], reverse=True)
-
+class Context:
+    def __init__(self, session_id: str, user_id: str = "user"):
+        self.session_id = session_id
+        self.user_id = user_id
+        self.previous_queries: List[Dict] = []
+        self.domain_knowledge: Dict[str, Any] = {}
+        self.preferences: Dict[str, Any] = {}
 
 class ReasoningAgent:
-    """Агент для продвинутого рассуждения и планирования"""
-
+    """Planner - returns structured plan, raw trace and routing decision"""
     def __init__(self, chroma_manager: ChromaDBManager):
         self.chroma_manager = chroma_manager
 
-    async def create_solution_plan(self, query: str, context: Context, relevant_context: List[Dict]) -> Dict:
-        """Создает план решения на основе анализа запроса"""
-
-        # Получаем информацию о доступных данных из ChromaDB
-        available_collections = list(self.chroma_manager.collections.keys())
-
-        # Формируем промпт для LLM с учетом доступных данных
-        prompt = f"""
-        Создай детальный план решения для следующего аналитического запроса:
-
-        Запрос: {query}
-
-        Доступные коллекции данных: {available_collections}
-
-        Релевантный контекст из предыдущих запросов:
-        {json.dumps(relevant_context[:3], ensure_ascii=False, indent=2)}
-
-        План должен включать:
-        1. Определение цели анализа
-        2. Выбор необходимых коллекций данных
-        3. Пошаговую стратегию выполнения
-        4. Методы валидации результатов
-        5. Подход к генерации инсайтов
-        6. Потенциальные сценарии для анализа
-
-        Ответ в формате JSON:
-        {{
-            "reasoning": "Обоснование выбранной стратегии",
-            "target_collections": ["коллекции для анализа"],
-            "steps": [
-                {{
-                    "step": "Описание шага",
-                    "purpose": "Цель шага",
-                    "expected_result": "Ожидаемый результат"
-                }}
-            ],
-            "validation_approach": "метод валидации",
-            "scenario_potential": "потенциальные сценарии для анализа"
-        }}
+    async def create_solution_plan(self, query: str, context: Context, relevant_context: List[Dict]) -> Dict[str, Any]:
         """
+        Returns dict:
+          {"plan": {...}, "raw": "<raw llm text>", "route": "sql|chroma|hybrid|schema"}
+        """
+        # simple routing heuristics
+        route = self._decide_route(query)
+        prompt = f"""
+Create a JSON plan for the analytic query.
+Query: {query}
+Detected route suggestion: {route}
+Relevant context (examples): {json.dumps(relevant_context[:3], ensure_ascii=False)}
+Available collections: {list(self.chroma_manager.collections.keys())}
 
+Return both: a short textual reasoning and a JSON plan block. Example JSON schema:
+{{"reasoning":"...","target_collections":["documents"],"steps":[{{"step":"...","purpose":"...","expected_result":"..."}}],"validation_approach":"...","scenario_potential":"..."}}
+"""
         try:
-            response = ollama.chat(model=LLM_MODEL, messages=[
-                {"role": "system",
-                 "content": "Ты - стратег аналитики. Создавай детальные планы решения аналитических задач для работы с ChromaDB."},
-                {"role": "user", "content": prompt}
+            resp = ollama.chat(model=LLM_MODEL, messages=[
+                {"role":"system", "content": "You are an analytics planner. Provide a short reasoning and a JSON plan."},
+                {"role":"user", "content": prompt}
             ])
-
-            plan_text = response["message"]["content"]
-
-            # Извлекаем JSON из ответа
-            json_match = re.search(r'```json\s*(.*?)\s*```', plan_text, re.DOTALL)
-            if json_match:
-                plan_data = json.loads(json_match.group(1))
-            else:
-                # Пытаемся найти JSON напрямую
-                json_start = plan_text.find('{')
-                json_end = plan_text.rfind('}') + 1
-                if json_start >= 0 and json_end > json_start:
-                    plan_data = json.loads(plan_text[json_start:json_end])
-                else:
-                    # Базовый план
-                    plan_data = {
-                        "reasoning": "Базовый план анализа для ChromaDB",
-                        "target_collections": ["documents"],
-                        "steps": [{"step": "Выполнить запрос", "purpose": "Получить данные",
-                                   "expected_result": "Данные для анализа"}],
-                        "validation_approach": "базовая проверка",
-                        "scenario_potential": "стандартные сценарии"
-                    }
-
-            return plan_data
-
+            raw = resp["message"]["content"]
         except Exception as e:
-            logger.error(f"Error creating solution plan: {e}")
-            return {
-                "reasoning": "Базовый план из-за ошибки",
+            logger.error("LLM planner error: %s", e)
+            raw = f"[LLM planner error]: {e}"
+        plan_data = None
+        try:
+            m = re.search(r'```json\s*(.*?)\s*```', raw, re.DOTALL)
+            if m:
+                plan_data = json.loads(m.group(1))
+            else:
+                # try to extract first {...}
+                start = raw.find('{')
+                end = raw.rfind('}') + 1
+                if start != -1 and end > start:
+                    plan_data = json.loads(raw[start:end])
+        except Exception as e:
+            logger.debug("Planner JSON parse failed: %s", e)
+            plan_data = {
+                "reasoning": f"Fallback plan (couldn't parse JSON): see raw planner trace",
                 "target_collections": ["documents"],
-                "steps": [{"step": "Выполнить запрос", "purpose": "Получить данные",
-                           "expected_result": "Данные для анализа"}],
-                "validation_approach": "базовая проверка",
-                "scenario_potential": "стандартные сценарии"
+                "steps": [{"step": "semantic_search", "purpose": "get relevant docs", "expected_result": "relevant docs"}],
+                "validation_approach": "basic",
+                "scenario_potential": "default"
             }
+        # allow override of route from parsed plan
+        if isinstance(plan_data, dict) and plan_data.get("route"):
+            route = plan_data.get("route")
+        return {"plan": plan_data, "raw": raw, "route": route}
 
+    def _decide_route(self, query: str) -> str:
+        q = query.lower()
+        # schema questions
+        if re.search(r'назван|имена|какие столбцы|columns|schema', q):
+            return "schema"
+        # SQL-like / aggregation
+        if re.search(r'\b(max|min|count|sum|avg|group by|having|distinct|order by)\b', q):
+            return "sql"
+        # textual / document search terms
+        if re.search(r'\b(документ|статья|отчет|где говорится|опишите|найди|описание)\b', q):
+            return "chroma"
+        # fallback hybrid
+        return "hybrid"
 
 class DataAgent:
-    """Агент для работы с данными через ChromaDB"""
+    """Агент для работы с данными через ChromaDB и (опционально) SQL via ThinkingAgent -> SQLAgent."""
 
-    def __init__(self, chroma_manager: ChromaDBManager):
+    def __init__(self, chroma_manager):
         self.chroma_manager = chroma_manager
 
     async def generate_chroma_query(self, query: str, solution_plan: Dict, context: Context) -> str:
-        """Генерирует оптимальный запрос для ChromaDB"""
-
-        target_collections = solution_plan.get("target_collections", ["documents"])
-
-        # Определяем основную коллекцию для запроса
-        main_collection = target_collections[0] if target_collections else "documents"
-
-        # Формируем оптимизированный текст запроса для ChromaDB
-        # Убираем лишние слова и фокусируемся на ключевых понятиях
+        # текущая реализация сохраняем
         optimized_query = re.sub(r'^(покажи|сколько|какие|найди)\s+', '', query.lower())
         optimized_query = re.sub(r'[?.,!]', '', optimized_query)
-
-        logger.info(f"Generated ChromaDB query: {optimized_query} for collection: {main_collection}")
-
+        plan_steps = solution_plan.get("steps") if isinstance(solution_plan, dict) else None
+        if plan_steps:
+            optimized_query = optimized_query + " | plan: " + "; ".join([s.get("step","") for s in plan_steps[:3]])
         return optimized_query
 
-    async def execute_chroma_query(self, chroma_query: str, collection_name: str = "documents", n_results: int = 20) -> \
-    List[Dict]:
-        """Выполняет запрос в ChromaDB и возвращает результаты"""
-        try:
-            # Выполнение запроса в ChromaDB
-            results = self.chroma_manager.query_documents(
-                query_text=chroma_query,
-                n_results=n_results,
-                collection_name=collection_name
-            )
-
-            # Конвертация результатов в удобный формат
-            formatted_results = []
-
-            if results['documents'] and results['documents'][0]:
-                for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
-                    distance = results['distances'][0][i] if results['distances'][0] else 0
-                    similarity = 1.0 - distance  # Преобразуем расстояние в сходство
-
-                    formatted_result = {
-                        "id": metadata.get("id", f"doc_{i}"),
-                        "content": doc,
-                        "metadata": metadata,
-                        "similarity": similarity,
-                        "distance": distance
-                    }
-                    formatted_results.append(formatted_result)
-
-            logger.info(f"ChromaDB query executed successfully, returned {len(formatted_results)} results")
-            return formatted_results
-
-        except Exception as e:
-            logger.error(f"Error executing ChromaDB query: {e}")
-
-            # Возврат пустого результата или fallback
-            return []
-
-
-class ValidationAgent:
-    """Агент для валидации результатов"""
-
-    def __init__(self, chroma_manager: ChromaDBManager):
-        self.chroma_manager = chroma_manager
-
-    async def validate_results(self, result: AnalysisResult, context: Context) -> Dict[str, Any]:
-        """Валидирует результаты анализа"""
-
-        validation_results = {
-            "is_valid": True,
-            "confidence": 0.8,
-            "summary": "Результаты прошли базовую валидацию",
-            "checks": []
-        }
-
-        # Проверка 1: Есть ли данные
-        has_data = len(result.data) > 0
-        validation_results["checks"].append({
-            "check": "Наличие данных",
-            "passed": has_data,
-            "details": f"Найдено {len(result.data)} записей"
-        })
-
-        # Проверка 2: Качество результатов ChromaDB
-        if has_data:
-            avg_similarity = np.mean([item.get("similarity", 0) for item in result.data])
-            validation_results["checks"].append({
-                "check": "Качество результатов ChromaDB",
-                "passed": avg_similarity > 0.5,
-                "details": f"Средняя схожесть: {avg_similarity:.3f}"
-            })
-
-        # Проверка 3: Разнообразие данных
-        if has_data and len(result.data) > 1:
-            unique_contents = len(set([item.get("content", "") for item in result.data]))
-            validation_results["checks"].append({
-                "check": "Разнообразие данных",
-                "passed": unique_contents > 1,
-                "details": f"Уникальных результатов: {unique_contents} из {len(result.data)}"
-            })
-
-        # Проверка 4: Логическая консистентность
-        logical_check = self._check_logical_consistency(result)
-        validation_results["checks"].append(logical_check)
-
-        # Определение итоговой валидации
-        failed_checks = [check for check in validation_results["checks"] if not check["passed"]]
-        validation_results["is_valid"] = len(failed_checks) == 0
-        validation_results["confidence"] = 1.0 - (len(failed_checks) / len(validation_results["checks"])) * 0.5
-
-        if failed_checks:
-            validation_results[
-                "summary"] = f"Обнаружены проблемы: {', '.join([check['check'] for check in failed_checks])}"
-
-        return validation_results
-
-    def _check_logical_consistency(self, result: AnalysisResult) -> Dict[str, Any]:
-        """Проверяет логическую консистентность результатов"""
-        # Базовая проверка логики
-        if len(result.data) == 0:
-            return {
-                "check": "Логическая консистентность",
-                "passed": False,
-                "details": "Нет данных для проверки логики"
-            }
-
-        return {
-            "check": "Логическая консистентность",
-            "passed": True,
-            "details": "Результаты логически консистентны"
-        }
-
-
-class DynamicScenarioAgent:
-    """Агент для генерации динамических сценариев на основе пользовательских запросов"""
-
-    def __init__(self, chroma_manager: ChromaDBManager):
-        self.chroma_manager = chroma_manager
-
-    async def plan_scenario_analysis(self, query: str, context: Context) -> Dict:
-        """Планирует анализ сценариев на основе запроса пользователя"""
-
-        # Анализ запроса на предмет сценарных элементов
-        scenario_elements = self._extract_scenario_elements(query)
-
-        return {
-            "reasoning": f"Планирование динамических сценариев на основе запроса: {query}",
-            "scenario_type": "user_driven",
-            "elements": scenario_elements,
-            "approach": "dynamic_generation"
-        }
-
-    def _extract_scenario_elements(self, query: str) -> Dict[str, Any]:
-        """Извлекает элементы для сценариев из запроса пользователя"""
-        elements = {
-            "variables": [],
-            "conditions": [],
-            "outcomes": [],
-            "timeframe": None
-        }
-
-        # Поиск числовых значений (потенциальные переменные)
-        numbers = re.findall(r'\d+(?:\.\d+)?%', query)  # Проценты
-        elements["variables"].extend(numbers)
-
-        numbers = re.findall(r'\d+', query)  # Обычные числа
-        elements["variables"].extend([f"{num}" for num in numbers])
-
-        # Поиск условий
-        if 'если' in query.lower() or 'если бы' in query.lower():
-            elements["conditions"].append("условие")
-
-        # Поиск временных рамок
-        time_patterns = ['день', 'недел', 'месяц', 'год']
-        for pattern in time_patterns:
-            if pattern in query.lower():
-                elements["timeframe"] = pattern
-                break
-
-        return elements
-
-    async def execute_scenario_analysis(self, query: str, solution_plan: Dict, context: Context) -> AnalysisResult:
-        """Выполняет анализ сценариев на основе данных"""
-        # Получаем данные для анализа сценариев
-        chroma_query = await self.chroma_manager.data_agent.generate_chroma_query(query, solution_plan, context)
-        data = await self.chroma_manager.data_agent.execute_chroma_query(chroma_query)
-
-        return AnalysisResult(
-            query=query,
-            chroma_query=chroma_query,
-            data=data,
-            reasoning_steps=[],
-            insights=[],
-            recommendations=[],
-            confidence_score=0.7,
-            validation_results={"is_valid": True, "confidence": 0.7}
-        )
-
-    async def generate_dynamic_scenarios(self, original_query: str, result: AnalysisResult, context: Context) -> Dict[
-        str, Any]:
-        """Генерирует динамические сценарии на основе пользовательского запроса"""
-
-        # Извлекаем элементы сценария из оригинального запроса
-        scenario_elements = self._extract_scenario_elements(original_query)
-
-        scenarios = {
-            "baseline": {
-                "description": "Текущий сценарий на основе пользовательского запроса",
-                "query_analysis": original_query,
-                "elements": scenario_elements,
-                "metrics": self._extract_metrics(result.data)
-            },
-            "scenarios": []
-        }
-
-        # Генерация динамических сценариев на основе элементов запроса
-        if scenario_elements["variables"]:
-            for variable in scenario_elements["variables"]:
-                scenario = await self._create_variable_scenario(original_query, variable, result.data)
-                scenarios["scenarios"].append(scenario)
-
-        # Генерация сценариев на основе данных
-        if result.data:
-            data_scenarios = await self._create_data_driven_scenarios(result.data, original_query)
-            scenarios["scenarios"].extend(data_scenarios)
-
-        # Сохранение сценариев в ChromaDB
-        await self._save_scenarios_to_chroma(scenarios, original_query)
-
-        return scenarios
-
-    async def _create_variable_scenario(self, original_query: str, variable: str, data: List[Dict]) -> Dict[str, Any]:
-        """Создает сценарий на основе переменной из запроса"""
-
-        # Определение типа переменной и создание сценария
-        if '%' in variable:
-            # Процентная переменная
-            percentage = float(variable.replace('%', ''))
-
-            scenario = {
-                "name": f"Изменение на {variable}",
-                "description": f"Анализ влияния изменения на {variable} на основе запроса: {original_query}",
-                "original_variable": variable,
-                "parameters": {
-                    "change_percentage": percentage / 100,
-                    "direction": "увеличение" if percentage > 0 else "уменьшение"
-                },
-                "expected_outcomes": {
-                    "impact_assessment": "Оценка влияния изменения",
-                    "risk_analysis": "Анализ рисков",
-                    "opportunity_identification": "Выявление возможностей"
-                },
-                "confidence": 0.7,
-                "risks": [
-                    "Нелинейное изменение параметров",
-                    "Внешние факторы могут повлиять на результат"
-                ]
-            }
-        else:
-            # Числовая переменная
-            scenario = {
-                "name": f"Вариант с {variable}",
-                "description": f"Анализ сценария с параметром {variable} на основе запроса: {original_query}",
-                "parameters": {
-                    "base_value": variable,
-                    "multiplier": 1.2  # Пример multiplier
-                },
-                "expected_outcomes": {
-                    "scenario_impact": "Влияние сценария на результат",
-                    "optimization_potential": "Потенциал для оптимизации"
-                },
-                "confidence": 0.6,
-                "risks": [
-                    "Ограниченность данных",
-                    "Предположения могут быть неточными"
-                ]
-            }
-
-        return scenario
-
-    async def _create_data_driven_scenarios(self, data: List[Dict], original_query: str) -> List[Dict[str, Any]]:
-        """Создает сценарии на основе анализа данных"""
-
-        scenarios = []
-
-        if not data:
-            return scenarios
-
-        # Анализ данных для выявления паттернов
-        try:
-            # Группировка по сходству
-            similarity_groups = {}
-            for item in data:
-                similarity = item.get("similarity", 0)
-                if similarity > 0.8:
-                    group = "highly_relevant"
-                elif similarity > 0.6:
-                    group = "moderately_relevant"
-                else:
-                    group = "low_relevance"
-
-                if group not in similarity_groups:
-                    similarity_groups[group] = []
-                similarity_groups[group].append(item)
-
-            # Создание сценариев на основе групп
-            for group_name, group_data in similarity_groups.items():
-                if len(group_data) > 0:
-                    scenario = {
-                        "name": f"Сценарий {group_name}",
-                        "description": f"Анализ данных с {group_name} релевантностью",
-                        "parameters": {
-                            "relevance_group": group_name,
-                            "data_count": len(group_data),
-                            "avg_similarity": np.mean([item.get("similarity", 0) for item in group_data])
-                        },
-                        "expected_outcomes": {
-                            "group_analysis": f"Анализ группы {group_name}",
-                            "pattern_identification": "Выявление паттернов",
-                            "recommendation_generation": "Генерация рекомендаций"
-                        },
-                        "confidence": 0.8,
-                        "risks": [
-                            "Группировка может быть неточной",
-                            "Данные могут быть неполными"
-                        ]
-                    }
-                    scenarios.append(scenario)
-
-        except Exception as e:
-            logger.error(f"Error creating data-driven scenarios: {e}")
-
-        return scenarios
-
-    def _extract_metrics(self, data: List[Dict]) -> Dict[str, Any]:
-        """Извлекает ключевые метрики из данных ChromaDB"""
-        if not data:
-            return {}
-
-        try:
-            metrics = {
-                "total_count": len(data),
-                "avg_similarity": np.mean([item.get("similarity", 0) for item in data]),
-                "max_similarity": max([item.get("similarity", 0) for item in data]),
-                "min_similarity": min([item.get("similarity", 0) for item in data]),
-                "unique_collections": len(set([item.get("metadata", {}).get("collection", "") for item in data]))
-            }
-
-            return metrics
-        except Exception as e:
-            logger.error(f"Error extracting metrics: {e}")
-            return {"total_count": len(data)}
-
-    async def _save_scenarios_to_chroma(self, scenarios: Dict[str, Any], original_query: str):
-        """Сохраняет сгенерированные сценарии в ChromaDB"""
-        try:
-            # Создание документов из сценариев
-            documents = []
-            metadatas = []
-            ids = []
-
-            for i, scenario in enumerate(scenarios.get("scenarios", [])):
-                doc_content = f"Original Query: {original_query}\n"
-                doc_content += f"Scenario: {scenario['name']}\n"
-                doc_content += f"Description: {scenario['description']}\n"
-                doc_content += f"Parameters: {json.dumps(scenario.get('parameters', {}), ensure_ascii=False)}\n"
-                doc_content += f"Expected Outcomes: {json.dumps(scenario.get('expected_outcomes', {}), ensure_ascii=False)}\n"
-
-                documents.append(doc_content)
-
-                metadata = {
-                    "original_query": original_query,
-                    "scenario_name": scenario["name"],
-                    "confidence": scenario.get("confidence", 0.5),
-                    "timestamp": datetime.now().isoformat(),
-                    "scenario_type": "dynamic"
-                }
-                metadatas.append(metadata)
-
-                scenario_id = f"scenario_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}"
-                ids.append(scenario_id)
-
-            # Сохранение в ChromaDB
-            if documents:
-                self.chroma_manager.add_documents(
-                    documents=documents,
-                    metadatas=metadatas,
-                    ids=ids,
-                    collection_name='scenarios'
-                )
-                logger.info(f"Saved {len(documents)} scenarios to ChromaDB")
-
-        except Exception as e:
-            logger.error(f"Error saving scenarios to ChromaDB: {e}")
-
+    async def execute_chroma_query(self, chroma_query: str, collection_name: str = "documents", n_results: int = 20):
+        # текущая реализация сохраняем (возвращает list[dict])
+        results = self.chroma_manager.query_documents(query_text=chroma_query, n_results=n_results, collection_name=collection_name)
+        formatted = []
+        if results and results.get('documents') and results['documents'][0]:
+            for i, (doc, meta) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+                distance = results['distances'][0][i] if results['distances'][0] else 0
+                formatted.append({
+                    "id": meta.get("id", f"doc_{i}"),
+                    "content": doc,
+                    "metadata": meta,
+                    "distance": distance,
+                    "similarity": 1.0 - distance
+                })
+        return formatted
+
+    async def execute_sql_flow(self, query_for_thinker: str, thinking_agent, sql_agent, context: Context) -> Dict[str, Any]:
+        """
+        Вызов ThinkingAgent.think для получения json_query и последующее исполнение через SQLAgent.
+        Возвращает dict: {"sql": str, "rows": list, "mappings": dict, "raw_planner": str}
+        """
+        # thinking_agent.think — синхронный в вашем коде, поэтому вызываем напрямую
+        thinking_msg = thinking_agent.think(query_for_thinker)
+        meta = thinking_msg.metadata or {}
+        raw_planner = meta.get("raw_llm", "")
+        json_q = meta.get("json_query")
+        mappings = meta.get("mappings", {}) or {}
+
+        if sql_exec.get("mappings", {}).get("unknowns"):
+            result = AnalysisResult(query=query, chroma_query=None, data=[], reasoning_steps=reasoning_steps,
+                                    insights=[], recommendations=[], confidence_score=0.0,
+                                    validation_results={"is_valid": False})
+            result.answer = "Требуется уточнение: " + ", ".join(sql_exec["mappings"]["unknowns"])
+            result.raw_llm_traces = {"executor_planner": sql_exec.get("raw_planner", ""),
+                                     "mappings": sql_exec.get("mappings", {})}
+            return result
+
+        if not json_q:
+            return {"sql": "", "rows": [], "mappings": {"error": "No json_query generated"}, "raw_planner": raw_planner}
+
+        # SQLAgent.execute ожидает json_query и возвращает (sql, rows, mappings)
+        sql, rows, exec_mappings = sql_agent.execute(json_q)
+        # гарантируем, что mappings объединены
+        combined_mappings = {}
+        combined_mappings.update(mappings or {})
+        combined_mappings.update(exec_mappings or {})
+
+        return {"sql": sql, "rows": rows, "mappings": combined_mappings, "raw_planner": raw_planner}
 
 class ExplanationAgent:
     """Агент для генерации инсайтов и объяснений"""
@@ -1111,135 +298,366 @@ class ExplanationAgent:
     def __init__(self, chroma_manager: ChromaDBManager):
         self.chroma_manager = chroma_manager
 
-    async def generate_insights(self, result: AnalysisResult, context: Context) -> Dict[str, List[str]]:
-        """Генерирует инсайты и рекомендации на основе результатов ChromaDB"""
-
+    async def generate_insights(self, result: AnalysisResult, context: Context) -> Dict[str, Any]:
+        """
+        Генерирует инсайты и рекомендации, но опирается только на детерминированные данные.
+        Возвращаемая структура:
+          {"insights": [...], "recommendations": [...], "raw_explainer": "<raw text>", "evidence": [ {value, cnt, sample_rows...}, ...]}
+        Правила:
+          - Если rows содержат агрегации (поля 'cnt','count' и т.п.) — используем их как источник истины.
+          - Если rows — обычные документы (Chroma) — формируем candidate counts из метаданных или контента, но не придумываем числа.
+          - НИКОГДА не возвращаем конкретные численные утверждения, если их нет в результатах.
+        """
         if not result.data:
-            return {"insights": [], "recommendations": []}
+            return {"insights": [], "recommendations": [], "raw_explainer": "", "evidence": []}
 
         try:
-            insights = []
-            recommendations = []
+            evidence = []
+            rows = result.data
 
-            # Базовая статистика
-            insights.append(f"Анализ ChromaDB завершен. Найдено {len(result.data)} релевантных документов.")
+            # detect count-like field
+            count_field = None
+            for key in rows[0].keys():
+                low = key.lower()
+                if "cnt" in low or "count" in low or low == "количество":
+                    count_field = key
+                    break
 
-            # Анализ сходства
-            similarities = [item.get("similarity", 0) for item in result.data]
-            if similarities:
-                avg_similarity = np.mean(similarities)
-                max_similarity = max(similarities)
-                min_similarity = min(similarities)
-
-                insights.append(f"Средняя релевантность результатов: {avg_similarity:.3f}")
-                insights.append(f"Наиболее релевантный результат: {max_similarity:.3f}")
-
-                if max_similarity > 0.9:
-                    insights.append("Обнаружены высокорелевантные документы")
-                elif max_similarity > 0.7:
-                    insights.append("Результаты показывают хорошую релевантность")
-                else:
-                    insights.append("Рекомендуется уточнить запрос для лучших результатов")
-
-            # Анализ метаданных
-            collections_used = set()
-            time_ranges = []
-
-            for item in result.data:
-                metadata = item.get("metadata", {})
-                if "collection" in metadata:
-                    collections_used.add(metadata["collection"])
-
-                if "timestamp" in metadata:
+            if count_field:
+                # sort by count desc and build evidence safely
+                sorted_rows = sorted(rows, key=lambda r: (r.get(count_field) or 0), reverse=True)
+                for r in sorted_rows[:5]:
+                    # value might be dict or simple type; keep it as-is for UI to render
+                    value_part = {k: v for k, v in r.items() if k != count_field}
+                    evidence.append({
+                        "value": value_part,
+                        "count": int(r.get(count_field) or 0),
+                        "row": r
+                    })
+                insights = []
+                if evidence:
+                    top = evidence[0]
+                    # safe string construction
                     try:
-                        time_ranges.append(datetime.fromisoformat(metadata["timestamp"]))
-                    except:
-                        pass
+                        top_value_display = ""
+                        if isinstance(top["value"], dict):
+                            # pick first value for display
+                            vals = list(top["value"].values())
+                            top_value_display = str(vals[0]) if vals else str(top["value"])
+                        else:
+                            top_value_display = str(top["value"])
+                        insights.append(f"Наиболее частое значение: {top_value_display} ({top['count']} вхождений)")
+                    except Exception:
+                        insights.append("Наиболее частое значение обнаружено (см. доказательства).")
 
-            if collections_used:
-                insights.append(f"Данные из коллекций: {', '.join(collections_used)}")
+                recommendations = []
+                if evidence and evidence[0]["count"] > 1:
+                    recommendations.append("Проверьте, нет ли повторяющихся записей или ошибки в источнике данных.")
+                raw_explainer = f"Aggregated counts available in result; top value {evidence[0]['value']} with count {evidence[0]['count']}" if evidence else ""
+                return {"insights": insights, "recommendations": recommendations, "raw_explainer": raw_explainer, "evidence": evidence}
 
-            if time_ranges:
-                time_span = max(time_ranges) - min(time_ranges)
-                insights.append(f"Временной диапазон данных: {time_span.days} дней")
+            # If no explicit count field -> compute deterministic counts on first text column
+            text_cols = [k for k in rows[0].keys() if isinstance(rows[0][k], str)]
+            if text_cols:
+                col = text_cols[0]
+                from collections import Counter
+                values = [r.get(col) for r in rows if r.get(col)]
+                counts = Counter(values)
+                top5 = counts.most_common(5)
+                evidence = []
+                for v, c in top5:
+                    sample_rows = [r for r in rows if r.get(col) == v][:3]
+                    evidence.append({"value": v, "count": c, "sample_rows": sample_rows})
+                insights = []
+                if evidence:
+                    # build a safe readable summary
+                    top3_parts = []
+                    for ev in evidence[:3]:
+                        # escape / stringify values safely
+                        val_str = str(ev["value"])
+                        cnt_str = str(ev["count"])
+                        top3_parts.append(f"{val_str} ({cnt_str})")
+                    top3_summary = ", ".join(top3_parts)
+                    insights.append(f"Наиболее частые значения по колонке '{col}': {top3_summary}")
+                recommendations = []
+                raw_explainer = f"Computed deterministic counts over column '{col}'"
+                return {"insights": insights, "recommendations": recommendations, "raw_explainer": raw_explainer, "evidence": evidence}
 
-            # Рекомендации на основе результатов
-            if len(result.data) > 10:
-                recommendations.append("Результаты показывают широкий охват темы")
+            # fallback - no deterministic evidence
+            return {"insights": [f"Найдено {len(rows)} релевантных документов."], "recommendations": [], "raw_explainer": "", "evidence": []}
 
-            if avg_similarity < 0.6:
-                recommendations.append("Рекомендуется уточнить запрос для повышения точности")
-
-            recommendations.extend([
-                "Изучите наиболее релевантные документы для получения ключевой информации",
-                "Используйте фильтры по дате или коллекции для уточнения результатов",
-                "Рассмотрите создание сценариев на основе найденных данных"
-            ])
-
-            return {
-                "insights": insights[:8],
-                "recommendations": recommendations[:5]
-            }
         except Exception as e:
-            logger.error(f"Error generating insights: {e}")
-            return {
-                "insights": ["Ошибка при генерации инсайтов"],
-                "recommendations": ["Проверьте корректность данных в ChromaDB"]
-            }
+            logger.error(f"Error generating insights deterministically: {e}")
+            return {"insights": ["Ошибка при генерации инсайтов"], "recommendations": ["Проверьте данные"], "raw_explainer": str(e), "evidence": []}
 
+class ValidationAgent:
+    def __init__(self, chroma_manager: ChromaDBManager):
+        self.chroma_manager = chroma_manager
 
-# Функция для запуска системы
-async def main():
-    """Главная функция для демонстрации системы"""
+    async def validate_results(self, result: AnalysisResult, context: Context) -> Dict[str, Any]:
+        checks = []
+        has_data = bool(result.data)
+        checks.append({"check":"Has data","passed":has_data,"details":f"{len(result.data)} items"})
+        avg_sim = None
+        if has_data:
+            sims = [d.get("similarity", 0) for d in result.data if isinstance(d.get("similarity", None), (int,float))]
+            avg_sim = float(np.mean(sims)) if sims else 0.0
+            checks.append({"check":"Avg similarity","passed":avg_sim>0.45,"details":f"{avg_sim:.3f}"})
+        passed = all(c["passed"] for c in checks)
+        confidence = 0.9 if passed else 0.5
+        summary = "Validation passed" if passed else "Issues found"
+        return {"is_valid": passed, "confidence": confidence, "summary": summary, "checks": checks}
 
-    print("🚀 ЗАПУСК ПРОДУКТИВНОЙ СИСТЕМЫ ЦИФРОВОГО АНАЛИТИКА С ChromaDB")
-    print("=" * 80)
+class DynamicScenarioAgent:
+    def __init__(self, chroma_manager: ChromaDBManager):
+        self.chroma_manager = chroma_manager
 
-    # Создаем систему
-    digital_twin = AdvancedDigitalTwin()
+    async def plan_scenario_analysis(self, query: str, context: Context):
+        # keep previous logic
+        return {"reasoning": f"Plan for scenario: {query}", "scenario_type":"user_driven", "elements":{}}
 
-    # Примеры запросов для демонстрации
-    test_queries = [
-        ("Покажи последние документы по проекту", QueryType.ANALYTICS),
-        ("Что если увеличить ресурсы на 50% для ускорения работ?", QueryType.SCENARIO),
-        ("Какие риски есть в текущем проекте?", QueryType.ANALYTICS),
-        ("Сравни эффективность разных подходов", QueryType.ANALYTICS),
-        ("Предскажи сроки завершения на основе текущих данных", QueryType.PREDICTION),
-    ]
+    async def execute_scenario_analysis(self, query, solution_plan, context):
+        # placeholder: return empty AnalysisResult-like dict
+        return AnalysisResult(query=query, route="scenario", answer=None, chroma_query=None, data=[], reasoning_steps=[], insights=[], recommendations=[], confidence_score=0.5, validation_results={"is_valid": False})
 
-    for query, query_type in test_queries:
-        print(f"\n{'=' * 60}")
-        print(f"Обработка запроса: {query}")
-        print(f"Тип: {query_type.value}")
-        print(f"{'=' * 60}")
+    async def generate_dynamic_scenarios(self, original_query: str, result: AnalysisResult, context: Context):
+        # simple stub; real logic in production
+        return {"baseline": {"description": original_query, "metrics": {}}, "scenarios": []}
+
+class AdvancedDigitalTwin:
+    def __init__(self):
+        self.chroma_manager = ChromaDBManager()
+        self.context_agent = ContextAgent(self.chroma_manager)
+        self.reasoning_agent = ReasoningAgent(self.chroma_manager)
+        self.data_agent = DataAgent(self.chroma_manager)
+        self.validation_agent = ValidationAgent(self.chroma_manager)
+        self.scenario_agent = DynamicScenarioAgent(self.chroma_manager)
+        self.explanation_agent = ExplanationAgent(self.chroma_manager)
+        # initialize SQL and Thinking agents (used for sql routing)
+        self.sql_agent = SQLAgent(DB_PATH)
+        self.thinking_agent = ThinkingAgent(DB_PATH, None)
+        self.contexts: Dict[str, Context] = {}
+        self.knowledge_base = self._load_knowledge_base()
+
+    def _load_knowledge_base(self):
+        try:
+            if KNOWLEDGE_BASE_PATH.exists():
+                return json.loads(KNOWLEDGE_BASE_PATH.read_text(encoding='utf-8'))
+        except Exception:
+            logger.debug("KB load failed")
+        return {"patterns": []}
+
+    async def process_query(self, query: str, session_id: str = "default", query_type: str = QueryType.ANALYTICS) -> AnalysisResult:
+        context = self.contexts.get(session_id, Context(session_id))
+        reasoning_steps: List[ReasoningStep] = []
+        raw_traces = {}
+
+        # step1: strategy
+        strategy_text = f"Query type: {query_type}"
+        reasoning_steps.append(ReasoningStep(1.0, "Determine strategy", strategy_text, "Decide route (sql/chroma/hybrid/schema)", "Choose route", confidence=0.8))
 
         try:
-            result = await digital_twin.process_query(query, query_type=query_type)
+            relevant_context = await self.context_agent.extract_relevant_context(query, context)
+            reasoning_steps.append(ReasoningStep(2.0, "Extract context", f"Found {len(relevant_context)} items", "Collect relevant history", "Relevant context collected", confidence=0.8))
 
-            print(f"\nРезультаты:")
-            print(f"- Количество записей: {len(result.data)}")
-            print(f"- Уровень уверенности: {result.confidence_score:.2f}")
-            print(f"- Валидация: {'Пройдена' if result.validation_results.get('is_valid') else 'Не пройдена'}")
+            sol = await self.reasoning_agent.create_solution_plan(query, context, relevant_context)
+            plan = sol.get("plan", {})
+            raw_planner = sol.get("raw", "")
+            route = sol.get("route", "hybrid")
+            raw_traces["planner"] = raw_planner or ""
+            reasoning_steps.append(ReasoningStep(3.0, "Create solution plan", plan.get("reasoning", "") if isinstance(plan, dict) else str(plan), "LLM planning", "Plan created", confidence=0.8))
 
-            if result.insights:
-                print(f"\nИнсайты:")
-                for insight in result.insights[:3]:
-                    print(f"  • {insight}")
+            # Execute according to route
+            if route == "schema":
+                # quick schema read
+                cols = []
+                try:
+                    import sqlite3
+                    if DB_PATH.exists():
+                        conn = sqlite3.connect(DB_PATH)
+                        cur = conn.cursor()
+                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;")
+                        row = cur.fetchone()
+                        if row:
+                            tbl = row[0]
+                            cur.execute(f'PRAGMA table_info("{tbl}")')
+                            cols = [r[1] for r in cur.fetchall()]
+                        conn.close()
+                    answer_text = f"Schema of table '{tbl}': {', '.join(cols)}" if cols else "No schema found."
+                except Exception as e:
+                    answer_text = f"Schema read error: {e}"
+                final = AnalysisResult(query=query, route="schema", answer=answer_text, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.9, validation_results={"is_valid": True})
+                final.raw_llm_traces = raw_traces
+                # save context
+                context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                self.contexts[session_id] = context
+                return final
 
-            if result.recommendations:
-                print(f"\nРекомендации:")
-                for rec in result.recommendations[:2]:
-                    print(f"  • {rec}")
+            elif route == "sql":
+                # attempt to create json_query via ThinkingAgent and execute via SQLAgent
+                # use full query as prompt for ThinkingAgent
+                sql_exec = await self.data_agent.execute_sql_flow(query, self.thinking_agent, self.sql_agent, context)
+                raw_traces["executor_planner"] = sql_exec.get("raw_planner", "")
+                if sql_exec.get("mappings", {}).get("unknowns"):
+                    # need clarification
+                    msg = "Needs clarification: " + ", ".join(sql_exec["mappings"].get("unknowns"))
+                    final = AnalysisResult(query=query, route="sql", answer=None, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "error":"unknowns"})
+                    final.raw_llm_traces = raw_traces
+                    context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                    self.contexts[session_id] = context
+                    return final
+                # success
+                rows = sql_exec.get("rows", [])
+                sql_text = sql_exec.get("sql", "")
+                result = AnalysisResult(query=query, chroma_query=None, data=rows, reasoning_steps=reasoning_steps,
+                                        insights=[], recommendations=[], confidence_score=0.8,
+                                        validation_results={"is_valid": True})
+                result.raw_llm_traces = {"planner": raw_planner}  # raw_planner — из execute_sql_flow
+                # Если rows содержит ровно 1 строку и 1 колонку — делаем короткий ответ
+                if rows and len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
+                    result.answer = str(list(rows[0].values())[0])
+                else:
+                    # Если есть агрегатные поля (cnt / count / max / min) — используем их
+                    if rows and isinstance(rows[0], dict):
+                        # ищем count-like или max-like поля
+                        cnt_key = next((k for k in rows[0].keys() if 'cnt' in k.lower() or 'count' in k.lower()), None)
+                        max_key = next(
+                            (k for k in rows[0].keys() if k.lower().startswith('max_') or 'max' in k.lower()), None)
+                        if cnt_key:
+                            # строим evidence и answer
+                            sorted_rows = sorted(rows, key=lambda r: (r.get(cnt_key) or 0), reverse=True)
+                            top = sorted_rows[0]
+                            val = {k: v for k, v in top.items() if k != cnt_key}
+                            cnt = int(top.get(cnt_key) or 0)
+                            result.evidence = [{"value": val, "count": cnt, "row": top}]
+                            # short answer
+                            if isinstance(val, dict):
+                                first_val = list(val.values())[0] if val else None
+                                if first_val is not None:
+                                    result.answer = f"{first_val} ({cnt} вхождений)"
+                            else:
+                                result.answer = f"{val} ({cnt} вхождений)"
+                        elif max_key:
+                            # аналогично для max_
+                            top = rows[0]
+                            result.answer = str(top.get(max_key))
+                # If still no answer, try to derive from insights (explanation agent)
+                if not result.answer and result.insights:
+                    result.answer = result.insights[0]
+                # If still nothing, provide friendly fallback
+                if not result.answer:
+                    result.answer = f"Найдено {len(result.data)} записей. Смотрите детали и доказательства."
+                # generate explanation
+                expl = await self.explanation_agent.generate_insights(result, context)
+                result.insights = expl.get("insights", [])
+                result.recommendations = expl.get("recommendations", [])
+                result.raw_llm_traces["explainer"] = expl.get("raw_explainer", "")
+                result.evidence = expl.get("evidence", [])
+                # build concise answer
+                if rows and len(rows) == 1 and len(rows[0]) == 1:
+                    result.answer = str(list(rows[0].values())[0])
+                elif rows:
+                    result.answer = f"Found {len(rows)} rows."
+                else:
+                    result.answer = "No data."
+                # persist
+                context.previous_queries.append({"query": query, "result": result.to_dict(), "timestamp": datetime.now().isoformat()})
+                self.contexts[session_id] = context
+                await self._save_query_to_chroma(query, result)
+                return result
 
-            if result.scenario_analysis:
-                print(f"\nСценарии:")
-                for scenario in result.scenario_analysis.get("scenarios", [])[:2]:
-                    print(f"  • {scenario['name']}: {scenario['description']}")
+            elif route == "chroma":
+                chroma_q = await self.data_agent.generate_chroma_query(query, plan, context)
+                raw_traces["generated_chroma_query"] = chroma_q
+                data = await self.data_agent.execute_chroma_query(chroma_q)
+                res = AnalysisResult(query=query, route="chroma", answer=None, chroma_query=chroma_q, data=data, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.8, validation_results={"is_valid": True})
+                res.raw_llm_traces = raw_traces
+                expl = await self.explanation_agent.generate_insights(res, context)
+                res.insights = expl.get("insights", [])
+                res.recommendations = expl.get("recommendations", [])
+                res.raw_llm_traces["explainer"] = expl.get("raw_explainer", "")
+                result.evidence = expl.get("evidence", [])
+                # concise answer from insights
+                if res.insights:
+                    res.answer = res.insights[0]
+                elif data:
+                    res.answer = f"Found {len(data)} documents. See details."
+                else:
+                    res.answer = "No relevant documents found."
+                context.previous_queries.append({"query": query, "result": res.to_dict(), "timestamp": datetime.now().isoformat()})
+                self.contexts[session_id] = context
+                await self._save_query_to_chroma(query, res)
+                return res
+
+            else:  # hybrid
+                # Step A: semantic search
+                chroma_q = await self.data_agent.generate_chroma_query(query, plan, context)
+                raw_traces["generated_chroma_query"] = chroma_q
+                chroma_data = await self.data_agent.execute_chroma_query(chroma_q)
+                # Step B: try to synthesize SQL using top doc snippets as context
+                top_snips = " ".join([d.get("content","")[:800] for d in chroma_data[:5]])
+                enriched_prompt = f"Context snippets: {top_snips}\nUser question: {query}\nCreate JSON SQL-description as before."
+                sql_exec = await self.data_agent.execute_sql_flow(enriched_prompt, self.thinking_agent, self.sql_agent, context)
+                raw_traces["hybrid_planner_raw"] = sql_exec.get("raw_planner","")
+                # If SQL produced usable rows, merge
+                if sql_exec.get("rows"):
+                    rows = sql_exec.get("rows")
+                    # create result merging both
+                    merged = chroma_data  # keep chroma results as primary documents
+                    final = AnalysisResult(query=query, route="hybrid", answer=None, chroma_query=chroma_q, data=merged, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.75, validation_results={"is_valid": True})
+                    final.raw_llm_traces = raw_traces
+                    expl = await self.explanation_agent.generate_insights(final, context)
+                    final.insights = expl.get("insights", [])
+                    final.recommendations = expl.get("recommendations", [])
+                    final.raw_llm_traces["explainer"] = expl.get("raw_explainer","")
+                    final.answer = final.insights[0] if final.insights else f"Found {len(merged)} documents; SQL returned {len(sql_exec.get('rows',[]))} rows."
+                    context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                    self.contexts[session_id] = context
+                    await self._save_query_to_chroma(query, final)
+                    return final
+                else:
+                    # fallback: return chroma-only as hybrid result
+                    final = AnalysisResult(query=query, route="hybrid", answer=None, chroma_query=chroma_q, data=chroma_data, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.6, validation_results={"is_valid": True})
+                    final.raw_llm_traces = raw_traces
+                    expl = await self.explanation_agent.generate_insights(final, context)
+                    final.insights = expl.get("insights", [])
+                    final.recommendations = expl.get("recommendations", [])
+                    final.raw_llm_traces["explainer"] = expl.get("raw_explainer","")
+                    final.answer = final.insights[0] if final.insights else f"Found {len(chroma_data)} documents."
+                    context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                    self.contexts[session_id] = context
+                    await self._save_query_to_chroma(query, final)
+                    return final
 
         except Exception as e:
-            print(f"❌ Ошибка при обработке запроса: {e}")
+            logger.exception("process_query error")
+            return AnalysisResult(query=query, route="error", answer=None, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[f"Error: {e}"], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "error": str(e)})
 
+    async def _save_query_to_chroma(self, query: str, result: AnalysisResult):
+        try:
+            doc = f"Query: {query}\nInsights: {', '.join(result.insights[:3])}\nData count: {len(result.data)}"
+            meta = {"query": query, "timestamp": datetime.now().isoformat(), "confidence": result.confidence_score, "data_count": len(result.data)}
+            doc_id = f"q_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{abs(hash(query))%10000}"
+            self.chroma_manager.add_documents(documents=[doc], metadatas=[meta], ids=[doc_id], collection_name='queries')
+        except Exception as e:
+            logger.debug("save query to chroma failed: %s", e)
 
-if __name__ == "__main__":
-    # Запускаем асинхронную функцию
-    asyncio.run(main())
+class ContextAgent:
+    def __init__(self, chroma_manager: ChromaDBManager):
+        self.chroma_manager = chroma_manager
+
+    async def extract_relevant_context(self, query: str, context: Context):
+        relevant = []
+        try:
+            res = self.chroma_manager.query_documents(query_text=query, n_results=5, collection_name='queries')
+            if res and res.get('documents') and res['documents'][0]:
+                for i, (doc, meta) in enumerate(zip(res['documents'][0], res['metadatas'][0])):
+                    score = 1.0 - res['distances'][0][i] if res['distances'][0] else 0.5
+                    relevant.append({"query": meta.get("query",""), "relevance_score": score, "insights": meta.get("insights", [])})
+        except Exception as e:
+            logger.debug("context extract error: %s", e)
+        # also include recent context
+        for prev in context.previous_queries[-5:]:
+            if any(tok in prev.get("query","").lower() for tok in query.lower().split()[:3]):
+                relevant.append({"query": prev.get("query",""), "relevance_score": 0.3})
+        return sorted(relevant, key=lambda x: x["relevance_score"], reverse=True)

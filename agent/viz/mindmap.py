@@ -21,9 +21,10 @@ def draw_mindmap():
     pos = nx.spring_layout(G, seed=42)
     nx.draw(G, pos, with_labels=True, node_size=3000, node_color='skyblue', font_size=10)
     plt.title("Mindmap базы данных проекта")
-    plt.savefig(r"generated\mindmap.png", dpi=150, bbox_inches='tight')
-    print("✅  Mindmap сохранена в generated\mindmap.png")
-
+    out_path = Path("generated") / "mindmap.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(str(out_path), dpi=150, bbox_inches='tight')
+    print(f"✅  Mindmap сохранена в {out_path}")
 
 if __name__ == "__main__":
     draw_mindmap()

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Union
 import re
 import difflib
 from sqlalchemy import create_engine, inspect
@@ -31,7 +31,7 @@ def _extract_candidate_identifiers(expr: str) -> List[str]:
             filtered.append(t)
     return filtered
 
-def _fuzzy_map_column(col_name: str, real_cols: Dict[str, str]) -> str | None:
+def _fuzzy_map_column(col_name: str, real_cols: Dict[str, str]) -> "Optional[str]":
     """
     Попытка мэппинга имени (возможно не точного) на реальные имена колонок.
     real_cols: mapping lowercase -> actual_name
@@ -51,20 +51,34 @@ def _fuzzy_map_column(col_name: str, real_cols: Dict[str, str]) -> str | None:
         return real_cols[matches2[0]]
     return None
 
-def build_sql_from_json(query_json: Dict[str, Any], db_path: str | Path) -> str:
+def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """
-    Преобразует JSON-описание запроса в SQL-строку.
-    Поддерживает select выражения с агрегатами/функциями (e.g. MAX(Дата) AS last_date),
-    а также нормализует и проверяет имена колонок в выражениях.
+    Преобразует JSON-описание запроса в (sql, params, mappings).
+
+    Контракт:
+      - sql: строка SQL для исполнения (если пустая — значит требуются уточнения)
+      - params: словарь параметров для parametrized execution (ключи без ':' как в SQLAlchemy)
+      - mappings: дополнительная информация, например:
+          {"unknowns": [...], "replacements": {...}, "error": "..."} либо {} если ничего
+
+    Поведение при нераспознанных колонках:
+    - Если LLM вернул UNKNOWN_... — добавляем их в mappings['unknowns'] и возвращаем sql = "".
+    - Если встретилась неизвестная колонка без UNKNOWN_ префикса — также считаем это unknown и возвращаем sql = "" с объяснением.
     """
     db_path = Path(db_path)
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     inspector = inspect(engine)
 
+    mappings: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
+
     try:
-        table = query_json["from"]
+        table = query_json.get("from")
+        if not table:
+            return "", {}, {"error": "'from' не указан в JSON"}
+
         if table not in inspector.get_table_names():
-            raise ValueError(f"Таблица '{table}' не существует.")
+            return "", {}, {"error": f"Таблица '{table}' не существует."}
 
         # real_cols: lowercase -> actual column name
         real_cols = {c["name"].lower(): c["name"] for c in inspector.get_columns(table)}
@@ -72,12 +86,15 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: str | Path) -> str:
         # SELECT
         select_items = query_json.get("select", ["*"])
         if not isinstance(select_items, list):
-            raise ValueError("'select' должен быть списком выражений.")
+            return "", {}, {"error": "'select' должен быть списком выражений."}
 
         cleaned_select: List[str] = []
+        replacements: Dict[str, str] = {}
+        unknowns: List[str] = []
+
         for expr in select_items:
             if not isinstance(expr, str):
-                raise ValueError(f"Элемент в select должен быть строкой: {expr}")
+                return "", {}, {"error": f"Элемент в select должен быть строкой: {expr}"}
             expr_work = expr.strip()
             # Если выражение == "*" — ок
             if expr_work == "*":
@@ -87,56 +104,89 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: str | Path) -> str:
             # Найдём кандидатов (возможные идентификаторы) в выражении и попытаемся замэппить
             candidates = _extract_candidate_identifiers(expr_work)
             for cand in candidates:
-                # пропускаем числа, ключевые слова, функции (MAX и т.п. уже исключены)
                 mapped = _fuzzy_map_column(cand, real_cols)
                 if mapped:
-                    # Заменяем в выражении все вхождения токена cand на "mapped"
-                    # Используем границы слов, чтобы не порезать другие слова
                     expr_work = re.sub(rf'(?<!\w){re.escape(cand)}(?!\w)', f'"{mapped}"', expr_work)
+                    replacements[cand] = mapped
                 else:
-                    # Если не нашли мэппинга — возможно LLM вернул UNKNOWN_... — оставляем как есть
-                    # но пометим это как потенциальную проблему: SQLBuilder не сможет выполнить запрос с несуществующими колонками.
-                    # Здесь мы предпочитаем вернуть ошибку, чтобы вызывающий компонент мог запросить уточнение.
-                    if re.match(r'^UNKNOWN_', cand, re.I):
-                        # пусть вызывающий обработает UNKNOWN_...
+                    if re.match(r'^UNKNOWN_[A-Za-z0-9_]+', cand, re.I):
+                        if cand not in unknowns:
+                            unknowns.append(cand)
+                        # оставляем placeholder в выражении, но запрос не будет выполнен
                         continue
-                    # иначе — колонка не найдена -> выбрасываем
-                    raise ValueError(f'Столбец "{cand}" (в выражении "{expr}") не найден в таблице {table}.')
+                    # неизвестная колонка -> помечаем как unknown для уточнения
+                    if cand not in unknowns:
+                        unknowns.append(cand)
 
             cleaned_select.append(expr_work)
 
+        # Если есть unknowns в select — вернём их для уточнения
+        if unknowns:
+            return "", {}, {"unknowns": unknowns, "replacements": replacements} if replacements else {"unknowns": unknowns}
+
         select_clause = ", ".join(cleaned_select)
 
-        # WHERE
+        # WHERE - строим parametrized условия
         where_parts = []
+        param_counter = 0
         if "where" in query_json and query_json["where"]:
+            if not isinstance(query_json["where"], list):
+                return "", {}, {"error": "'where' должен быть списком условий."}
             for cond in query_json["where"]:
+                if not isinstance(cond, dict):
+                    continue
                 col = cond.get("column")
-                op = cond.get("operator", "=")
+                op = cond.get("operator", "=").strip()
                 val = cond.get("value")
-                if isinstance(col, str) and col.startswith("UNKNOWN_"):
-                    # Unknown placeholder — вызывающий должен инициировать уточнение; сигнализируем об ошибке
-                    raise ValueError(f'Неизвестная колонка/placeholder в where: "{col}"')
-                # постараемся найти колонку (функции в where не поддерживаем)
-                mapped = _fuzzy_map_column(col, real_cols) if isinstance(col, str) else None
+                if isinstance(col, str) and re.match(r'^UNKNOWN_[A-Za-z0-9_]+', col, re.I):
+                    if col not in unknowns:
+                        unknowns.append(col)
+                    continue
+                mapped = _fuzzy_map_column(str(col), real_cols) if isinstance(col, str) else None
                 if not mapped:
-                    raise ValueError(f'Столбец "{col}" не найден в таблице {table}.')
-                # Экранируем значение
-                val_str = str(val).replace("'", "''") if val is not None else ""
-                where_parts.append(f'"{mapped}" {op} \'{val_str}\'')
+                    if col and col not in unknowns:
+                        unknowns.append(col)
+                    continue
+                pname = f"p{param_counter}"
+                param_counter += 1
+                if op.upper() == "IN" and isinstance(val, (list, tuple)):
+                    placeholders = []
+                    for i, v in enumerate(val):
+                        pn = f"{pname}_{i}"
+                        params[pn] = v
+                        placeholders.append(f":{pn}")
+                    where_parts.append(f'"{mapped}" IN ({", ".join(placeholders)})')
+                elif val is None:
+                    if op in ("=", "=="):
+                        where_parts.append(f'"{mapped}" IS NULL')
+                    elif op in ("!=", "<>"):
+                        where_parts.append(f'"{mapped}" IS NOT NULL')
+                    else:
+                        where_parts.append(f'"{mapped}" {op} NULL')
+                else:
+                    params[pname] = val
+                    where_parts.append(f'"{mapped}" {op} :{pname}')
+
+        # Если есть unknowns в where — возвращаем для уточнения
+        if unknowns:
+            out = {"unknowns": unknowns}
+            if replacements:
+                out["replacements"] = replacements
+            return "", {}, out
+
         where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-        # GROUP BY (если есть) — принимаем список
+        # GROUP BY
         group_clause = ""
         gb = query_json.get("group_by") or query_json.get("groupby") or []
         if gb:
             if not isinstance(gb, list):
-                raise ValueError("'group_by' должен быть списком")
+                return "", {}, {"error": "'group_by' должен быть списком."}
             gb_cols = []
             for c in gb:
                 mapped = _fuzzy_map_column(str(c), real_cols)
                 if not mapped:
-                    raise ValueError(f'Столбец для group_by "{c}" не найден в таблице {table}.')
+                    return "", {}, {"error": f'Столбец для group_by "{c}" не найден', "unknowns": [c]}
                 gb_cols.append(f'"{mapped}"')
             group_clause = " GROUP BY " + ", ".join(gb_cols)
 
@@ -157,7 +207,7 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: str | Path) -> str:
                     continue
                 mapped = _fuzzy_map_column(str(col), real_cols)
                 if not mapped:
-                    raise ValueError(f'Столбец для order_by "{col}" не найден в таблице {table}.')
+                    return "", {}, {"error": f'Столбец для order_by "{col}" не найден', "unknowns": [col]}
                 parts.append(f'"{mapped}" {dirc}')
             if parts:
                 order_clause = " ORDER BY " + ", ".join(parts)
@@ -168,11 +218,17 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: str | Path) -> str:
             try:
                 limit_clause = f" LIMIT {int(query_json['limit'])}"
             except Exception:
-                raise ValueError("'limit' должен быть целым числом.")
+                return "", {}, {"error": "'limit' должен быть целым числом."}
 
         sql_parts = [f"SELECT {select_clause}", f'FROM "{table}"', where_clause, group_clause, order_clause, limit_clause]
         final_sql = " ".join([p for p in sql_parts if p]).strip()
-        return final_sql
+
+        # build mappings only if non-empty
+        out_mappings = {}
+        if replacements:
+            out_mappings["replacements"] = replacements
+
+        return final_sql, params, out_mappings
 
     except Exception as e:
-        raise ValueError(f"Ошибка построения SQL из JSON: {e}") from e
+        return "", {}, {"error": f"Ошибка построения SQL из JSON: {e}"}
