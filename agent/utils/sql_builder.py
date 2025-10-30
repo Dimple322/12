@@ -101,6 +101,20 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
                 cleaned_select.append(expr_work)
                 continue
 
+            # Если это вызов функции (COUNT(...), SUM(...), и т.п.) — пытаемся заменить UNKNOWN_ внутри
+            if re.match(r'^\s*[A-Za-z_][A-Za-z0-9_]*\s*\(.*\)\s*$', expr_work):
+                # заменим UNKNOWN_* внутри выражения по эвристике или пометим unknowns
+                for m in re.findall(r'UNKNOWN_[A-Za-z0-9_]+', expr_work, flags=re.I):
+                    base = m.replace('UNKNOWN_', '')
+                    mapped = _fuzzy_map_column(base, real_cols)
+                    if mapped:
+                        expr_work = expr_work.replace(m, f'"{mapped}"')
+                    else:
+                        if m not in unknowns:
+                            unknowns.append(m)
+                cleaned_select.append(expr_work)
+                continue
+
             # Найдём кандидатов (возможные идентификаторы) в выражении и попытаемся замэппить
             candidates = _extract_candidate_identifiers(expr_work)
             for cand in candidates:
@@ -120,6 +134,10 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
 
             cleaned_select.append(expr_work)
 
+        # Если select пуст (например, LLM вернул []), подставляем "*"
+        if not cleaned_select:
+            cleaned_select = ["*"]
+
         # Если есть unknowns в select — вернём их для уточнения
         if unknowns:
             return "", {}, {"unknowns": unknowns, "replacements": replacements} if replacements else {"unknowns": unknowns}
@@ -136,7 +154,12 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
                 if not isinstance(cond, dict):
                     continue
                 col = cond.get("column")
-                op = cond.get("operator", "=").strip()
+                op = (cond.get("operator") or "=").strip().upper()
+                # нормализуем частые опечатки операторов
+                if op == ">>":
+                    op = ">"
+                elif op == "<<":
+                    op = "<"
                 val = cond.get("value")
                 if isinstance(col, str) and re.match(r'^UNKNOWN_[A-Za-z0-9_]+', col, re.I):
                     if col not in unknowns:
@@ -149,6 +172,12 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
                     continue
                 pname = f"p{param_counter}"
                 param_counter += 1
+                if isinstance(val, str):
+                    # Проверяем ссылку на другую колонку для сравнения столбец-столбец
+                    mapped_val = _fuzzy_map_column(val, real_cols)
+                    if mapped_val:
+                        where_parts.append(f'"{mapped}" {op} "{mapped_val}"')
+                        continue
                 if op.upper() == "IN" and isinstance(val, (list, tuple)):
                     placeholders = []
                     for i, v in enumerate(val):
@@ -157,7 +186,12 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
                         placeholders.append(f":{pn}")
                     where_parts.append(f'"{mapped}" IN ({", ".join(placeholders)})')
                 elif val is None:
-                    if op in ("=", "=="):
+                    # поддержка унарных операторов IS NULL / IS NOT NULL
+                    if op in ("IS NULL",):
+                        where_parts.append(f'"{mapped}" IS NULL')
+                    elif op in ("IS NOT NULL",):
+                        where_parts.append(f'"{mapped}" IS NOT NULL')
+                    elif op in ("=", "=="):
                         where_parts.append(f'"{mapped}" IS NULL')
                     elif op in ("!=", "<>"):
                         where_parts.append(f'"{mapped}" IS NOT NULL')
@@ -205,10 +239,14 @@ def build_sql_from_json(query_json: Dict[str, Any], db_path: Union[str, Path]) -
                     dirc = toks[1].upper() if len(toks) > 1 else "ASC"
                 else:
                     continue
-                mapped = _fuzzy_map_column(str(col), real_cols)
-                if not mapped:
-                    return "", {}, {"error": f'Столбец для order_by "{col}" не найден', "unknowns": [col]}
-                parts.append(f'"{mapped}" {dirc}')
+                # Если это выражение (содержит не-идентификаторные символы) — не мэппим, используем как есть
+                if isinstance(col, str) and not re.match(r'^[A-Za-zА-Яа-я_][A-Za-zА-Яа-я0-9_]*$', col):
+                    parts.append(f'{col} {dirc}')
+                else:
+                    mapped = _fuzzy_map_column(str(col), real_cols)
+                    if not mapped:
+                        return "", {}, {"error": f'Столбец для order_by "{col}" не найден', "unknowns": [col]}
+                    parts.append(f'"{mapped}" {dirc}')
             if parts:
                 order_clause = " ORDER BY " + ", ".join(parts)
 

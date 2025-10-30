@@ -8,12 +8,14 @@ import difflib
 
 import ollama
 from sqlalchemy import create_engine, inspect, text
+import asyncio
 
 from agent.utils.knowledge_base import load_knowledge_base
 from agent.utils.logger import get_logger
+from agent.utils.config import LLM_MODEL as CFG_LLM_MODEL
 
 logger = get_logger(__name__)
-LLM_MODEL = "digital_twin_analyst"
+LLM_MODEL = CFG_LLM_MODEL
 
 @dataclass
 class Message:
@@ -34,6 +36,10 @@ class ThinkingAgent:
         self._last_json: Optional[dict] = None
         self._last_mappings: Optional[dict] = None
         self._last_raw: Optional[str] = None
+        self.session_preferences: Dict[str, str] = {}
+
+    def set_session_preferences(self, prefs: Dict[str, str]):
+        self.session_preferences = prefs or {}
 
     def think(self, user_text: str) -> Message:
         """Думает вслух и возвращает assistant Message с metadata: raw_llm, json_query (если есть), mappings (если unknowns)."""
@@ -86,6 +92,8 @@ class ThinkingAgent:
             return msg
 
         normalized = self._normalize_query(parsed)
+        # Heuristic: try to resolve UNKNOWN_* via synonyms, session preferences and schema
+        normalized = self._heuristic_map_unknowns(normalized, table_ctx, user_text)
         unknowns = self._find_unknowns_in_json(normalized)
 
         # Compute suggestions/explanations for unknowns
@@ -119,6 +127,11 @@ class ThinkingAgent:
         self.history.append(msg)
         return msg
 
+    async def athink(self, user_text: str) -> Message:
+        """Асинхронная обёртка вокруг think(), чтобы не блокировать event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.think, user_text)
+
     def apply_user_clarification(self, clarification: str, json_query: Optional[dict] = None) -> Message:
         """
         Применяет уточнение к последнему json (или к переданному) и возвращает assistant Message.
@@ -144,9 +157,12 @@ class ThinkingAgent:
         table_ctx = inspector.get_table_names()[0] if inspector.get_table_names() else None
         table_cols = [c["name"] for c in inspector.get_columns(table_ctx)] if table_ctx else []
 
-        # parse "KEY=VALUE" or plain value
-        if "=" in clar:
-            k, v = map(str.strip, clar.split("=", 1))
+        # parse "KEY=VALUE" or "KEY:VALUE" or plain value; strip quotes
+        sep = "=" if "=" in clar else (":" if ":" in clar else None)
+        if sep:
+            k, v = map(str.strip, clar.split(sep, 1))
+            k = k.strip('"\' ')
+            v = v.strip('"\' ')
             target = None
             for unk in unknowns:
                 if k.lower() in unk.lower() or unk.lower().endswith(k.lower()) or unk == k:
@@ -155,12 +171,16 @@ class ThinkingAgent:
             if target is None and unknowns:
                 target = unknowns[0]
 
-            # determine if v matches a column name
+            # determine if v matches a column name (fuzzy)
             matched_col = None
             for col in table_cols:
                 if col.lower() == v.lower():
                     matched_col = col
                     break
+            if not matched_col and v:
+                possible = difflib.get_close_matches(v.lower(), [c.lower() for c in table_cols], n=1, cutoff=0.7)
+                if possible:
+                    matched_col = next((c for c in table_cols if c.lower() == possible[0]), None)
 
             if matched_col:
                 # If computation hint present and suggests computation, build expression and replace placeholder
@@ -253,6 +273,71 @@ class ThinkingAgent:
         return msg
 
     # === helpers ===
+    def _heuristic_map_unknowns(self, q: dict, table: Optional[str], question: str) -> dict:
+        """Простая авто-подстановка: сопоставляет UNKNOWN_* по синонимам и ближайшим колонкам.
+        Примеры: budget|стоимост|цена -> budget/planned_cost/planned_productivity; срок|дата -> date/start/end.
+        """
+        try:
+            inspector = inspect(self.engine)
+            table_ctx = table or (inspector.get_table_names()[0] if inspector.get_table_names() else None)
+            cols = [c["name"] for c in (inspector.get_columns(table_ctx) if table_ctx else [])]
+            low_cols = {c.lower(): c for c in cols}
+
+            def pick(*candidates: str) -> Optional[str]:
+                for cand in candidates:
+                    if cand.lower() in low_cols:
+                        return low_cols[cand.lower()]
+                # fuzzy
+                for cand in candidates:
+                    m = difflib.get_close_matches(cand.lower(), list(low_cols.keys()), n=1, cutoff=0.7)
+                    if m:
+                        return low_cols[m[0]]
+                return None
+
+            q2 = json.loads(json.dumps(q))  # shallow copy via json
+            text = (question or "").lower()
+
+            budget_col = pick("budget", "planned_cost", "cost", "price", "planned_budget", "planned_productivity")
+            date_col = pick("date", "end_date", "finish_date", "due_date")
+            start_col = pick("start_date", "date_start", "begin_date")
+
+            # map WHERE unknown columns
+            for cond in q2.get("where", []) or []:
+                col = cond.get("column")
+                if isinstance(col, str) and col.startswith("UNKNOWN_"):
+                    name = col.replace("UNKNOWN_", "").lower()
+                    # session preferences first
+                    for key, mapped_col in (self.session_preferences or {}).items():
+                        if key.lower() in name or key.lower() in text:
+                            if mapped_col in cols:
+                                cond["column"] = mapped_col
+                                name = ""  # considered resolved
+                                break
+                    if any(k in name or k in text for k in ["budget", "стоимост", "цена"]):
+                        if budget_col:
+                            cond["column"] = budget_col
+                    elif any(k in name or k in text for k in ["срок", "deadline", "дата"]):
+                        # try date columns
+                        if date_col:
+                            cond["column"] = date_col
+
+            # also replace occurrences in select expressions
+            sel = []
+            for expr in q2.get("select", []) or []:
+                if isinstance(expr, str) and "UNKNOWN_" in expr:
+                    e = expr
+                    if budget_col:
+                        e = e.replace("UNKNOWN_budget", budget_col)
+                    if date_col:
+                        e = e.replace("UNKNOWN_date", date_col)
+                    sel.append(e)
+                else:
+                    sel.append(expr)
+            if sel:
+                q2["select"] = sel
+            return q2
+        except Exception:
+            return q
     def _extract_task_json(self, think_text: str) -> Optional[dict]:
         if not think_text:
             return None
