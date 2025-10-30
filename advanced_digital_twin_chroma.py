@@ -30,19 +30,25 @@ import numpy as np
 from agent.sql_agent import SQLAgent
 from agent.thinking_agent import ThinkingAgent
 from agent.llm.ollama_client import AnalystLLM
-
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
-from datetime import datetime
+from agent.utils.config import (
+    DB_PATH as CFG_DB_PATH,
+    CHROMA_PATH as CFG_CHROMA_PATH,
+    KNOWLEDGE_BASE_PATH as CFG_KB_PATH,
+    LLM_MODEL as CFG_LLM_MODEL,
+    ensure_directories,
+)
+from gpu_embed_global import gpu_embedding
 
 # For types already in file we keep minimal imports (plotting etc are used by UI)
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-LLM_MODEL = "digital_twin_analyst"
-CHROMA_PATH = Path("generated/chroma_db")
-KNOWLEDGE_BASE_PATH = Path("generated/knowledge_base_productive.json")
-DB_PATH = Path("generated/digital_twin.db")  # sqlite DB used by SQLAgent / schema queries
+# Resolve configuration (prefer productive data)
+ensure_directories()
+LLM_MODEL = CFG_LLM_MODEL
+CHROMA_PATH = CFG_CHROMA_PATH
+KNOWLEDGE_BASE_PATH = CFG_KB_PATH
+DB_PATH = CFG_DB_PATH  # sqlite DB used by SQLAgent / schema queries
 
 class QueryType:
     ANALYTICS = "analytics"
@@ -124,12 +130,12 @@ class ChromaDBManager:
         self._initialize_collections()
 
     def _initialize_collections(self):
-        # note: embedding_function set elsewhere (gpu_embed_global)
+        # use global embedding function
         try:
-            self.collections['documents'] = self.client.get_or_create_collection(name="documents")
-            self.collections['queries'] = self.client.get_or_create_collection(name="queries")
-            self.collections['insights'] = self.client.get_or_create_collection(name="insights")
-            self.collections['scenarios'] = self.client.get_or_create_collection(name="scenarios")
+            self.collections['documents'] = self.client.get_or_create_collection(name="documents", embedding_function=gpu_embedding)
+            self.collections['queries'] = self.client.get_or_create_collection(name="queries", embedding_function=gpu_embedding)
+            self.collections['insights'] = self.client.get_or_create_collection(name="insights", embedding_function=gpu_embedding)
+            self.collections['scenarios'] = self.client.get_or_create_collection(name="scenarios", embedding_function=gpu_embedding)
         except Exception as e:
             logger.warning("ChromaDB initialize error: %s", e)
 
@@ -167,23 +173,51 @@ class ReasoningAgent:
         """
         Returns dict:
           {"plan": {...}, "raw": "<raw llm text>", "route": "sql|chroma|hybrid|schema"}
+        For schema-related queries we return a deterministic plan and DO NOT call LLM
+        (avoids LLM suggesting searching Chroma for schema info).
         """
-        # simple routing heuristics
+        # decide route first
         route = self._decide_route(query)
-        prompt = f"""
-Create a JSON plan for the analytic query.
-Query: {query}
-Detected route suggestion: {route}
-Relevant context (examples): {json.dumps(relevant_context[:3], ensure_ascii=False)}
-Available collections: {list(self.chroma_manager.collections.keys())}
 
-Return both: a short textual reasoning and a JSON plan block. Example JSON schema:
-{{"reasoning":"...","target_collections":["documents"],"steps":[{{"step":"...","purpose":"...","expected_result":"..."}}],"validation_approach":"...","scenario_potential":"..."}}
-"""
+        # If the query is about schema/column names — return deterministic plan (no LLM)
+        if route == "schema":
+            plan_data = {
+                "reasoning": "Deterministic schema read: fetch table list and PRAGMA table_info for table 'data' if exists, otherwise first table.",
+                "target_collections": [],
+                "steps": [
+                    {
+                        "step": "Find SQLite table 'data' or fallback to first table",
+                        "purpose": "Determine which table to inspect for column names",
+                        "expected_result": "Table name to inspect"
+                    },
+                    {
+                        "step": "Run PRAGMA table_info(<table>) to get columns",
+                        "purpose": "Return list of columns",
+                        "expected_result": "List of column names"
+                    }
+                ],
+                "validation_approach": "Schema returned directly from SQLite PRAGMA is authoritative",
+                "scenario_potential": "Applicable for all schema/column name queries"
+            }
+            raw = "[deterministic planner] schema read (no LLM)"
+            return {"plan": plan_data, "raw": raw, "route": "schema"}
+
+        # Otherwise fall back to LLM planner (existing behaviour)
+        prompt = f"""
+    Create a JSON plan for the analytic query.
+    Query: {query}
+    Detected route suggestion: {route}
+    Relevant context (examples): {json.dumps(relevant_context[:3], ensure_ascii=False)}
+    Available collections: {list(self.chroma_manager.collections.keys())}
+
+    Return both: a short textual reasoning and a JSON plan block. Example JSON schema:
+    {{"reasoning":"...","target_collections":["documents"],"steps":[{{"step":"...","purpose":"...","expected_result":"..."}}],"validation_approach":"...","scenario_potential":"..."}}
+    """
         try:
             resp = ollama.chat(model=LLM_MODEL, messages=[
-                {"role":"system", "content": "You are an analytics planner. Provide a short reasoning and a JSON plan."},
-                {"role":"user", "content": prompt}
+                {"role": "system",
+                 "content": "You are an analytics planner. Provide a short reasoning and a JSON plan."},
+                {"role": "user", "content": prompt}
             ])
             raw = resp["message"]["content"]
         except Exception as e:
@@ -205,7 +239,8 @@ Return both: a short textual reasoning and a JSON plan block. Example JSON schem
             plan_data = {
                 "reasoning": f"Fallback plan (couldn't parse JSON): see raw planner trace",
                 "target_collections": ["documents"],
-                "steps": [{"step": "semantic_search", "purpose": "get relevant docs", "expected_result": "relevant docs"}],
+                "steps": [
+                    {"step": "semantic_search", "purpose": "get relevant docs", "expected_result": "relevant docs"}],
                 "validation_approach": "basic",
                 "scenario_potential": "default"
             }
@@ -214,19 +249,35 @@ Return both: a short textual reasoning and a JSON plan block. Example JSON schem
             route = plan_data.get("route")
         return {"plan": plan_data, "raw": raw, "route": route}
 
+        # Замените метод ReasoningAgent._decide_route на следующий (вставьте вместо старого)
     def _decide_route(self, query: str) -> str:
-        q = query.lower()
-        # schema questions
-        if re.search(r'назван|имена|какие столбцы|columns|schema', q):
-            return "schema"
-        # SQL-like / aggregation
-        if re.search(r'\b(max|min|count|sum|avg|group by|having|distinct|order by)\b', q):
-            return "sql"
-        # textual / document search terms
-        if re.search(r'\b(документ|статья|отчет|где говорится|опишите|найди|описание)\b', q):
-            return "chroma"
-        # fallback hybrid
-        return "hybrid"
+            q = (query or "").lower().strip()
+            # explicit force tokens (user can prefix query with "schema:" etc.)
+            if q.startswith("schema:") or q.startswith("[schema]") or q.startswith("sql:"):
+                return "schema"
+            if q.startswith("chroma:") or q.startswith("[chroma]"):
+                return "chroma"
+            if q.startswith("hybrid:") or q.startswith("[hybrid]"):
+                return "hybrid"
+
+            # schema / column questions (широкий набор русских синонимов)
+            if re.search(
+                    r'(колонк|столбц|наименован|наименование|назван|названий|название|имена\s+столбц|какие\s+столбцы|имена столбцов|какое\s+наименование|как\W+называют\W+колонки|список\s+столбцов)',
+                    q):
+                return "schema"
+
+            # SQL-like / aggregation
+            if re.search(
+                    r'\b(max|min|count|sum|avg|group by|having|distinct|order by|сколько|сумма|средн|максимальн|минимальн|самая поздн)\b',
+                    q):
+                return "sql"
+
+            # textual / document search terms
+            if re.search(r'\b(документ|статья|отчет|отчёт|где говорится|опишите|найди|описание|файл|док)\b', q):
+                return "chroma"
+
+            # fallback hybrid
+            return "hybrid"
 
 class DataAgent:
     """Агент для работы с данными через ChromaDB и (опционально) SQL via ThinkingAgent -> SQLAgent."""
@@ -244,48 +295,57 @@ class DataAgent:
         return optimized_query
 
     async def execute_chroma_query(self, chroma_query: str, collection_name: str = "documents", n_results: int = 20):
-        # текущая реализация сохраняем (возвращает list[dict])
-        results = self.chroma_manager.query_documents(query_text=chroma_query, n_results=n_results, collection_name=collection_name)
+        results = self.chroma_manager.query_documents(query_text=chroma_query, n_results=n_results,
+                                                      collection_name=collection_name)
         formatted = []
         if results and results.get('documents') and results['documents'][0]:
             for i, (doc, meta) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
                 distance = results['distances'][0][i] if results['distances'][0] else 0
-                formatted.append({
+                flat = {
                     "id": meta.get("id", f"doc_{i}"),
                     "content": doc,
-                    "metadata": meta,
                     "distance": distance,
-                    "similarity": 1.0 - distance
-                })
+                    "similarity": 1.0 - distance if distance is not None else None,
+                    # все поля из meta на верхний уровень
+                    **{k: v for k, v in meta.items()}
+                }
+                # оставляем metadata для обратной совместимости
+                flat["metadata"] = meta
+                formatted.append(flat)
         return formatted
 
     async def execute_sql_flow(self, query_for_thinker: str, thinking_agent, sql_agent, context: Context) -> Dict[str, Any]:
         """
         Вызов ThinkingAgent.think для получения json_query и последующее исполнение через SQLAgent.
         Возвращает dict: {"sql": str, "rows": list, "mappings": dict, "raw_planner": str}
+        НЕ выполняет SQL, если mappings содержит unknowns (SQLAgent сам вернёт mappings в этом случае).
         """
-        # thinking_agent.think — синхронный в вашем коде, поэтому вызываем напрямую
-        thinking_msg = thinking_agent.think(query_for_thinker)
-        meta = thinking_msg.metadata or {}
+        # Prefer non-blocking call if available
+        thinking_msg = await getattr(thinking_agent, "athink", thinking_agent.think)(query_for_thinker)
+        meta = getattr(thinking_msg, "metadata", {}) or {}
         raw_planner = meta.get("raw_llm", "")
         json_q = meta.get("json_query")
         mappings = meta.get("mappings", {}) or {}
 
-        if sql_exec.get("mappings", {}).get("unknowns"):
-            result = AnalysisResult(query=query, chroma_query=None, data=[], reasoning_steps=reasoning_steps,
-                                    insights=[], recommendations=[], confidence_score=0.0,
-                                    validation_results={"is_valid": False})
-            result.answer = "Требуется уточнение: " + ", ".join(sql_exec["mappings"]["unknowns"])
-            result.raw_llm_traces = {"executor_planner": sql_exec.get("raw_planner", ""),
-                                     "mappings": sql_exec.get("mappings", {})}
-            return result
+        # Safety: если json_q содержит UNKNOWN_ плейсхолдеры, но mappings пуст — добавим их
+        try:
+            import re as _re
+            if json_q and not mappings.get("unknowns"):
+                txt = json.dumps(json_q, ensure_ascii=False)
+                found = list(dict.fromkeys(_re.findall(r'UNKNOWN_[A-Za-z0-9_]+', txt)))
+                if found:
+                    mappings = {**mappings, "unknowns": found}
+        except Exception:
+            pass
 
+        # Если ThinkingAgent не сгенерировал json_query — возвращаем mappings/raw и позволяем верхнему слою запросить уточнение
         if not json_q:
-            return {"sql": "", "rows": [], "mappings": {"error": "No json_query generated"}, "raw_planner": raw_planner}
+            return {"sql": "", "rows": [], "mappings": mappings or {"error": "No json_query generated"}, "raw_planner": raw_planner}
 
-        # SQLAgent.execute ожидает json_query и возвращает (sql, rows, mappings)
+        # Передаём json_query в SQLAgent.execute — он вернёт (sql, rows, mappings)
         sql, rows, exec_mappings = sql_agent.execute(json_q)
-        # гарантируем, что mappings объединены
+
+        # объединяем mappings (те, что Thinking дал + те, что вернул SQL builder/executor)
         combined_mappings = {}
         combined_mappings.update(mappings or {})
         combined_mappings.update(exec_mappings or {})
@@ -299,89 +359,28 @@ class ExplanationAgent:
         self.chroma_manager = chroma_manager
 
     async def generate_insights(self, result: AnalysisResult, context: Context) -> Dict[str, Any]:
-        """
-        Генерирует инсайты и рекомендации, но опирается только на детерминированные данные.
-        Возвращаемая структура:
-          {"insights": [...], "recommendations": [...], "raw_explainer": "<raw text>", "evidence": [ {value, cnt, sample_rows...}, ...]}
-        Правила:
-          - Если rows содержат агрегации (поля 'cnt','count' и т.п.) — используем их как источник истины.
-          - Если rows — обычные документы (Chroma) — формируем candidate counts из метаданных или контента, но не придумываем числа.
-          - НИКОГДА не возвращаем конкретные численные утверждения, если их нет в результатах.
-        """
         if not result.data:
             return {"insights": [], "recommendations": [], "raw_explainer": "", "evidence": []}
-
         try:
-            evidence = []
             rows = result.data
-
-            # detect count-like field
-            count_field = None
-            for key in rows[0].keys():
-                low = key.lower()
-                if "cnt" in low or "count" in low or low == "количество":
-                    count_field = key
-                    break
-
-            if count_field:
-                # sort by count desc and build evidence safely
-                sorted_rows = sorted(rows, key=lambda r: (r.get(count_field) or 0), reverse=True)
-                for r in sorted_rows[:5]:
-                    # value might be dict or simple type; keep it as-is for UI to render
-                    value_part = {k: v for k, v in r.items() if k != count_field}
-                    evidence.append({
-                        "value": value_part,
-                        "count": int(r.get(count_field) or 0),
-                        "row": r
-                    })
-                insights = []
-                if evidence:
-                    top = evidence[0]
-                    # safe string construction
-                    try:
-                        top_value_display = ""
-                        if isinstance(top["value"], dict):
-                            # pick first value for display
-                            vals = list(top["value"].values())
-                            top_value_display = str(vals[0]) if vals else str(top["value"])
-                        else:
-                            top_value_display = str(top["value"])
-                        insights.append(f"Наиболее частое значение: {top_value_display} ({top['count']} вхождений)")
-                    except Exception:
-                        insights.append("Наиболее частое значение обнаружено (см. доказательства).")
-
-                recommendations = []
-                if evidence and evidence[0]["count"] > 1:
-                    recommendations.append("Проверьте, нет ли повторяющихся записей или ошибки в источнике данных.")
-                raw_explainer = f"Aggregated counts available in result; top value {evidence[0]['value']} with count {evidence[0]['count']}" if evidence else ""
-                return {"insights": insights, "recommendations": recommendations, "raw_explainer": raw_explainer, "evidence": evidence}
-
-            # If no explicit count field -> compute deterministic counts on first text column
-            text_cols = [k for k in rows[0].keys() if isinstance(rows[0][k], str)]
-            if text_cols:
-                col = text_cols[0]
+            # Найти поле для агрегации — сначала ищем "Подобъект" (разных вариантов), иначе первую строковую колонку
+            target_cols = [k for k in rows[0].keys() if re.search(r'подобъект', k, re.I)]
+            col = target_cols[0] if target_cols else None
+            if col:
                 from collections import Counter
                 values = [r.get(col) for r in rows if r.get(col)]
                 counts = Counter(values)
                 top5 = counts.most_common(5)
-                evidence = []
-                for v, c in top5:
-                    sample_rows = [r for r in rows if r.get(col) == v][:3]
-                    evidence.append({"value": v, "count": c, "sample_rows": sample_rows})
+                evidence = [{"value": v, "count": c, "sample_rows": [r for r in rows if r.get(col) == v][:3]} for v, c
+                            in top5]
                 insights = []
                 if evidence:
-                    # build a safe readable summary
-                    top3_parts = []
-                    for ev in evidence[:3]:
-                        # escape / stringify values safely
-                        val_str = str(ev["value"])
-                        cnt_str = str(ev["count"])
-                        top3_parts.append(f"{val_str} ({cnt_str})")
-                    top3_summary = ", ".join(top3_parts)
+                    top3_summary = ", ".join([f"{e['value']} ({e['count']})" for e in evidence[:3]])
                     insights.append(f"Наиболее частые значения по колонке '{col}': {top3_summary}")
                 recommendations = []
-                raw_explainer = f"Computed deterministic counts over column '{col}'"
-                return {"insights": insights, "recommendations": recommendations, "raw_explainer": raw_explainer, "evidence": evidence}
+                raw_explainer = f"Deterministic aggregation over column '{col}'"
+                return {"insights": insights, "recommendations": recommendations, "raw_explainer": raw_explainer,
+                        "evidence": evidence}
 
             # fallback - no deterministic evidence
             return {"insights": [f"Найдено {len(rows)} релевантных документов."], "recommendations": [], "raw_explainer": "", "evidence": []}
@@ -439,6 +438,30 @@ class AdvancedDigitalTwin:
         self.contexts: Dict[str, Context] = {}
         self.knowledge_base = self._load_knowledge_base()
 
+    def _is_date_question(self, text: str) -> bool:
+        q = (text or "").lower()
+        return any(tok in q for tok in ["самая ран", "ранняя дата", "минимальная дата", "min date", "earliest", "дата"])
+
+    def _suggest_date_columns(self) -> Dict[str, Any]:
+        try:
+            from sqlalchemy import create_engine, inspect
+            engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
+            insp = inspect(engine)
+            tables = insp.get_table_names()
+            candidates = []
+            # Prefer table named 'data' if exists
+            ordered = [t for t in tables if t == 'data'] + [t for t in tables if t != 'data']
+            for t in ordered[:5]:
+                cols = insp.get_columns(t)
+                for c in cols:
+                    name = c.get("name", "")
+                    typ = str(c.get("type", "")).lower()
+                    if any(k in name.lower() for k in ["date", "дата", "start", "начал", "end", "оконча", "finish"]) or "date" in typ:
+                        candidates.append({"table": t, "column": name})
+            return {"date_candidates": candidates}
+        except Exception:
+            return {"date_candidates": []}
+
     def _load_knowledge_base(self):
         try:
             if KNOWLEDGE_BASE_PATH.exists():
@@ -469,39 +492,58 @@ class AdvancedDigitalTwin:
 
             # Execute according to route
             if route == "schema":
-                # quick schema read
+                # deterministic schema read: prefer table named 'data', otherwise first table
                 cols = []
+                tbl = None
                 try:
                     import sqlite3
                     if DB_PATH.exists():
                         conn = sqlite3.connect(DB_PATH)
                         cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1;")
-                        row = cur.fetchone()
-                        if row:
-                            tbl = row[0]
+                        # get all tables
+                        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                        rows = [r[0] for r in cur.fetchall()]
+                        if "data" in [r.lower() for r in rows]:
+                            # find actual name with case preserved
+                            for r in rows:
+                                if r.lower() == "data":
+                                    tbl = r
+                                    break
+                        elif rows:
+                            tbl = rows[0]
+                        if tbl:
                             cur.execute(f'PRAGMA table_info("{tbl}")')
                             cols = [r[1] for r in cur.fetchall()]
                         conn.close()
-                    answer_text = f"Schema of table '{tbl}': {', '.join(cols)}" if cols else "No schema found."
+                    answer_text = f"Columns of table '{tbl}':\n" + "\n".join(
+                        cols) if cols else "No schema found or table is empty."
                 except Exception as e:
                     answer_text = f"Schema read error: {e}"
-                final = AnalysisResult(query=query, route="schema", answer=answer_text, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.9, validation_results={"is_valid": True})
+                final = AnalysisResult(query=query, route="schema", answer=answer_text, chroma_query=None, data=[],
+                                       reasoning_steps=reasoning_steps, insights=[], recommendations=[],
+                                       confidence_score=0.95, validation_results={"is_valid": True})
                 final.raw_llm_traces = raw_traces
                 # save context
-                context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                context.previous_queries.append(
+                    {"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
                 self.contexts[session_id] = context
                 return final
 
             elif route == "sql":
                 # attempt to create json_query via ThinkingAgent and execute via SQLAgent
                 # use full query as prompt for ThinkingAgent
+                # pass session preferences to thinker
+                self.thinking_agent.set_session_preferences(self.contexts.get(session_id, Context(session_id)).preferences)
                 sql_exec = await self.data_agent.execute_sql_flow(query, self.thinking_agent, self.sql_agent, context)
                 raw_traces["executor_planner"] = sql_exec.get("raw_planner", "")
                 if sql_exec.get("mappings", {}).get("unknowns"):
-                    # need clarification
-                    msg = "Needs clarification: " + ", ".join(sql_exec["mappings"].get("unknowns"))
-                    final = AnalysisResult(query=query, route="sql", answer=None, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "error":"unknowns"})
+                    # need clarification — build user-friendly prompt with options
+                    m = sql_exec["mappings"]
+                    unknowns = m.get("unknowns", [])
+                    suggestions = m.get("suggestions", {})
+                    guesses = m.get("column_guesses", {})
+                    question = "Требуются уточнения по: " + ", ".join(unknowns)
+                    final = AnalysisResult(query=query, route="sql", answer=question, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": unknowns, "suggestions": suggestions, "guesses": guesses})
                     final.raw_llm_traces = raw_traces
                     context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
                     self.contexts[session_id] = context
@@ -509,17 +551,43 @@ class AdvancedDigitalTwin:
                 # success
                 rows = sql_exec.get("rows", [])
                 sql_text = sql_exec.get("sql", "")
-                result = AnalysisResult(query=query, chroma_query=None, data=rows, reasoning_steps=reasoning_steps,
-                                        insights=[], recommendations=[], confidence_score=0.8,
-                                        validation_results={"is_valid": True})
-                result.raw_llm_traces = {"planner": raw_planner}  # raw_planner — из execute_sql_flow
+                build_maps = sql_exec.get("mappings", {}) or {}
+                if build_maps.get("error") and "Таблица" in build_maps.get("error", ""):
+                    # ask to choose a table
+                    try:
+                        from sqlalchemy import create_engine, inspect
+                        engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
+                        insp = inspect(engine)
+                        tbls = insp.get_table_names()
+                    except Exception:
+                        tbls = []
+                    question = "Выберите таблицу для запроса"
+                    final = AnalysisResult(query=query, route="sql", answer=question, chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": ["table"], "suggestions": {"table": tbls}, "guesses": {}})
+                    final.raw_llm_traces = {"planner": sql_exec.get("raw_planner", ""), "sql": sql_text}
+                    context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                    self.contexts[session_id] = context
+                    return final
+                # If empty rows for date-like question — ask clarification for date column
+                if (not rows) and self._is_date_question(query):
+                    sugg = self._suggest_date_columns()
+                    final = AnalysisResult(query=query, route="sql", answer="Требуется указать колонку даты (например, date/end_date)", chroma_query=None, data=[], reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": ["UNKNOWN_date"], "suggestions": {"UNKNOWN_date": [f"{x['table']}.{x['column']}" for x in sugg.get('date_candidates', [])]}, "guesses": {}})
+                    final.raw_llm_traces = {"planner": sql_exec.get("raw_planner", ""), "sql": sql_text}
+                    context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
+                    self.contexts[session_id] = context
+                    return final
+
+                result = AnalysisResult(query=query, route="sql", chroma_query=None, data=rows,
+                                        reasoning_steps=reasoning_steps, insights=[], recommendations=[],
+                                        confidence_score=0.8, validation_results={"is_valid": True})
+                # сохранить trace планировщика/исполнителя
+                result.raw_llm_traces = {"planner": sql_exec.get("raw_planner", ""), "sql": sql_text}
                 # Если rows содержит ровно 1 строку и 1 колонку — делаем короткий ответ
                 if rows and len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
                     result.answer = str(list(rows[0].values())[0])
                 else:
                     # Если есть агрегатные поля (cnt / count / max / min) — используем их
                     if rows and isinstance(rows[0], dict):
-                        # ищем count-like или max-like поля
+                        # ищем count-like или max-like полей
                         cnt_key = next((k for k in rows[0].keys() if 'cnt' in k.lower() or 'count' in k.lower()), None)
                         max_key = next(
                             (k for k in rows[0].keys() if k.lower().startswith('max_') or 'max' in k.lower()), None)
@@ -542,24 +610,20 @@ class AdvancedDigitalTwin:
                             top = rows[0]
                             result.answer = str(top.get(max_key))
                 # If still no answer, try to derive from insights (explanation agent)
-                if not result.answer and result.insights:
-                    result.answer = result.insights[0]
-                # If still nothing, provide friendly fallback
-                if not result.answer:
-                    result.answer = f"Найдено {len(result.data)} записей. Смотрите детали и доказательства."
-                # generate explanation
+                # generate explanation FIRST so explanation can operate on result.data (if needed)
                 expl = await self.explanation_agent.generate_insights(result, context)
                 result.insights = expl.get("insights", [])
                 result.recommendations = expl.get("recommendations", [])
                 result.raw_llm_traces["explainer"] = expl.get("raw_explainer", "")
                 result.evidence = expl.get("evidence", [])
-                # build concise answer
-                if rows and len(rows) == 1 and len(rows[0]) == 1:
-                    result.answer = str(list(rows[0].values())[0])
-                elif rows:
-                    result.answer = f"Found {len(rows)} rows."
-                else:
-                    result.answer = "No data."
+                if not result.answer and result.insights:
+                    result.answer = result.insights[0]
+                # If still nothing, provide friendly fallback
+                if not result.answer:
+                    if rows and isinstance(rows, list):
+                        result.answer = f"Найдено {len(rows)} записей. Смотрите детали и доказательства."
+                    else:
+                        result.answer = "Нет данных."
                 # persist
                 context.previous_queries.append({"query": query, "result": result.to_dict(), "timestamp": datetime.now().isoformat()})
                 self.contexts[session_id] = context
@@ -576,14 +640,15 @@ class AdvancedDigitalTwin:
                 res.insights = expl.get("insights", [])
                 res.recommendations = expl.get("recommendations", [])
                 res.raw_llm_traces["explainer"] = expl.get("raw_explainer", "")
-                result.evidence = expl.get("evidence", [])
-                # concise answer from insights
+                # assign evidence into res (was buggy: previously assigned to result)
+                res.evidence = expl.get("evidence", [])
+                # concise answer from insights or fallback
                 if res.insights:
                     res.answer = res.insights[0]
                 elif data:
-                    res.answer = f"Found {len(data)} documents. See details."
+                    res.answer = f"Найдено {len(data)} документов. Смотрите детали."
                 else:
-                    res.answer = "No relevant documents found."
+                    res.answer = "Нет релевантных документов."
                 context.previous_queries.append({"query": query, "result": res.to_dict(), "timestamp": datetime.now().isoformat()})
                 self.contexts[session_id] = context
                 await self._save_query_to_chroma(query, res)
@@ -597,33 +662,54 @@ class AdvancedDigitalTwin:
                 # Step B: try to synthesize SQL using top doc snippets as context
                 top_snips = " ".join([d.get("content","")[:800] for d in chroma_data[:5]])
                 enriched_prompt = f"Context snippets: {top_snips}\nUser question: {query}\nCreate JSON SQL-description as before."
+                self.thinking_agent.set_session_preferences(self.contexts.get(session_id, Context(session_id)).preferences)
                 sql_exec = await self.data_agent.execute_sql_flow(enriched_prompt, self.thinking_agent, self.sql_agent, context)
                 raw_traces["hybrid_planner_raw"] = sql_exec.get("raw_planner","")
                 # If SQL produced usable rows, merge
                 if sql_exec.get("rows"):
                     rows = sql_exec.get("rows")
-                    # create result merging both
-                    merged = chroma_data  # keep chroma results as primary documents
+                    # if chroma has no docs, return SQL rows as primary data
+                    merged = chroma_data if chroma_data else rows
                     final = AnalysisResult(query=query, route="hybrid", answer=None, chroma_query=chroma_q, data=merged, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.75, validation_results={"is_valid": True})
                     final.raw_llm_traces = raw_traces
                     expl = await self.explanation_agent.generate_insights(final, context)
                     final.insights = expl.get("insights", [])
                     final.recommendations = expl.get("recommendations", [])
                     final.raw_llm_traces["explainer"] = expl.get("raw_explainer","")
-                    final.answer = final.insights[0] if final.insights else f"Found {len(merged)} documents; SQL returned {len(sql_exec.get('rows',[]))} rows."
+                    final.evidence = expl.get("evidence", [])
+                    final.answer = final.insights[0] if final.insights else (
+                        f"Найдено {len(chroma_data)} документов; SQL вернул {len(rows)} строк." if chroma_data else f"SQL вернул {len(rows)} строк."
+                    )
                     context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
                     self.contexts[session_id] = context
                     await self._save_query_to_chroma(query, final)
                     return final
                 else:
-                    # fallback: return chroma-only as hybrid result
+                    # If need clarification — return prompt to user; else fallback chroma-only
+                    if sql_exec.get("mappings", {}).get("unknowns"):
+                        m = sql_exec["mappings"]
+                        unknowns = m.get("unknowns", [])
+                        suggestions = m.get("suggestions", {})
+                        guesses = m.get("column_guesses", {})
+                        question = "Требуются уточнения по: " + ", ".join(unknowns)
+                        final = AnalysisResult(query=query, route="hybrid", answer=question, chroma_query=chroma_q, data=chroma_data, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.5, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": unknowns, "suggestions": suggestions, "guesses": guesses})
+                    elif self._is_date_question(query):
+                        # Ask for date column if date-like question and no SQL rows
+                        sugg = self._suggest_date_columns()
+                        final = AnalysisResult(query=query, route="hybrid", answer="Требуется указать колонку даты (например, date/end_date)", chroma_query=chroma_q, data=chroma_data, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.5, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": ["UNKNOWN_date"], "suggestions": {"UNKNOWN_date": [f"{x['table']}.{x['column']}" for x in sugg.get('date_candidates', [])]}, "guesses": {}})
+                    else:
                     final = AnalysisResult(query=query, route="hybrid", answer=None, chroma_query=chroma_q, data=chroma_data, reasoning_steps=reasoning_steps, insights=[], recommendations=[], confidence_score=0.6, validation_results={"is_valid": True})
                     final.raw_llm_traces = raw_traces
                     expl = await self.explanation_agent.generate_insights(final, context)
                     final.insights = expl.get("insights", [])
                     final.recommendations = expl.get("recommendations", [])
                     final.raw_llm_traces["explainer"] = expl.get("raw_explainer","")
-                    final.answer = final.insights[0] if final.insights else f"Found {len(chroma_data)} documents."
+                    final.evidence = expl.get("evidence", [])
+                    if final.validation_results.get("needs_clarification"):
+                        # keep clarification question as answer
+                        pass
+                    else:
+                    final.answer = final.insights[0] if final.insights else f"Найдено {len(chroma_data)} документов."
                     context.previous_queries.append({"query": query, "result": final.to_dict(), "timestamp": datetime.now().isoformat()})
                     self.contexts[session_id] = context
                     await self._save_query_to_chroma(query, final)
@@ -641,6 +727,44 @@ class AdvancedDigitalTwin:
             self.chroma_manager.add_documents(documents=[doc], metadatas=[meta], ids=[doc_id], collection_name='queries')
         except Exception as e:
             logger.debug("save query to chroma failed: %s", e)
+
+    async def _save_clarification_to_chroma(self, session_id: str, clarification: str):
+        try:
+            doc = f"Clarification: {clarification}\nSession: {session_id}"
+            meta = {"type": "clarification", "session_id": session_id, "timestamp": datetime.now().isoformat()}
+            doc_id = f"c_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{abs(hash(session_id+clarification))%10000}"
+            self.chroma_manager.add_documents(documents=[doc], metadatas=[meta], ids=[doc_id], collection_name='queries')
+        except Exception as e:
+            logger.debug("save clarification to chroma failed: %s", e)
+
+    async def clarify(self, session_id: str, clarification: str) -> AnalysisResult:
+        """Применяет уточнение пользователя к последнему json_query и выполняет SQL маршрут."""
+        context = self.contexts.get(session_id) or Context(session_id)
+        # применяем уточнение в мыслителе
+        msg = self.thinking_agent.apply_user_clarification(clarification)
+        meta = getattr(msg, "metadata", {}) or {}
+        json_q = meta.get("json_query")
+        mappings = meta.get("mappings", {}) or {}
+        # Сохраняем простые предпочтения (если строка вида KEY=ColumnName и колонка существует)
+        # Позже можно расширить на хранение в Chroma
+        if "=" in clarification:
+            k, v = map(str.strip, clarification.split("=", 1))
+            if v:
+                context.preferences[k] = v
+        self.contexts[session_id] = context
+        # persist clarification into Chroma for future retrieval
+        await self._save_clarification_to_chroma(session_id, clarification)
+        # Если unknowns ещё остались — вернём просьбу уточнить дальше
+        if mappings.get("unknowns"):
+            return AnalysisResult(query="[clarify]", route="sql", answer="Требуются дополнительные уточнения: " + ", ".join(mappings.get("unknowns", [])), chroma_query=None, data=[], reasoning_steps=[], insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": mappings.get("unknowns", [])})
+        # Иначе выполним SQL
+        sql, rows, exec_mappings = self.sql_agent.execute(json_q or {})
+        if exec_mappings.get("unknowns"):
+            return AnalysisResult(query="[clarify]", route="sql", answer="Требуются дополнительные уточнения: " + ", ".join(exec_mappings.get("unknowns", [])), chroma_query=None, data=[], reasoning_steps=[], insights=[], recommendations=[], confidence_score=0.0, validation_results={"is_valid": False, "needs_clarification": True, "unknowns": exec_mappings.get("unknowns", [])})
+        res = AnalysisResult(query="[clarify]", route="sql", answer=None, chroma_query=None, data=rows, reasoning_steps=[], insights=[], recommendations=[], confidence_score=0.8, validation_results={"is_valid": True})
+        if rows and len(rows) == 1 and isinstance(rows[0], dict) and len(rows[0]) == 1:
+            res.answer = str(list(rows[0].values())[0])
+        return res
 
 class ContextAgent:
     def __init__(self, chroma_manager: ChromaDBManager):

@@ -342,12 +342,11 @@ def main():
         print("Используйте --help для просмотра всех опций")
         
         if setup_environment():
-            # Проверяем наличие данных
+            # Проверяем наличие данных и не генерируем тестовые по умолчанию
             db_path = Path("generated/digital_twin_advanced.db")
             if not db_path.exists():
-                print("Данные не найдены, генерирую тестовые...")
-                generate_test_data()
-            
+                print("⚠️ Продуктивные данные не найдены: generated/digital_twin_advanced.db")
+                print("   Загрузите свои данные через load_user_data.py или укажите DT_DB_PATH в .env")
             run_interface("web")
 
 if __name__ == "__main__":

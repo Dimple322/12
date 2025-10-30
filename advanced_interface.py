@@ -14,6 +14,11 @@ import plotly.graph_objects as go
 from pathlib import Path
 from datetime import datetime
 import sys
+from sqlalchemy import create_engine, inspect, text
+import re
+
+from agent.utils.config import DB_PATH as CFG_DB_PATH
+DB_PATH = CFG_DB_PATH
 
 # Добавляем путь к модулю
 sys.path.append(str(Path(__file__).parent))
@@ -88,6 +93,14 @@ st.markdown('<h1 class="main-header">🧠 Продвинутый цифрово�
 with st.sidebar:
     st.header("⚙️ Настройки")
 
+    backend_choice = st.selectbox(
+        "Принудительный backend (auto = автоопределение):",
+        options=["auto", "sql", "chroma", "hybrid", "schema"],
+        index=0,
+        help="Выберите, куда направлять запрос: auto/ sql / chroma / hybrid / schema"
+    )
+    st.session_state.backend_choice = backend_choice
+
     # Выбор типа запроса
     query_type = st.selectbox(
         "Тип запроса",
@@ -128,9 +141,68 @@ with st.sidebar:
                 mime="application/json"
             )
 
+def wizard_sql():
+    import pandas as pd
+    import sqlalchemy
+    st.header('🔍 Мастер-пошаговый SQL Wizard')
+    # state
+    if 'wizard' not in st.session_state or st.session_state.get('reset_wizard'):
+        st.session_state['wizard'] = {'step': 0, 'table': None, 'table_confirmed': False, 'reasonings': {}, 'column': None, 'column_confirmed': False, 'agg': None, 'agg_confirmed': False}
+        st.session_state['reset_wizard'] = False
+
+    wizard = st.session_state['wizard']
+    step = wizard.get('step', 0)
+
+    # 1. Выбор таблицы
+    with st.expander('🗂️ Шаг 1: Выберите таблицу для анализа', expanded=(step == 0)):
+        tables = []
+        try:
+            engine = sqlalchemy.create_engine(f'sqlite:///{DB_PATH}')
+            inspector = sqlalchemy.inspect(engine)
+            tables = inspector.get_table_names()
+        except Exception as e:
+            st.error(f'Ошибка получения списка таблиц: {e}')
+        tables_rus = tables if tables else []
+        choose_table = st.selectbox('Таблица:', tables_rus, index=0 if tables_rus else None, key='wizard_table_select')
+        # reasoning по выбору таблицы
+        st.info(f'LLM reasoning: Для данного анализа рекомендуется работать с таблицей "{choose_table}" — это ваша основная структура для аналитики.')
+        preview = None
+        if choose_table:
+            try:
+                with engine.begin() as conn:
+                    preview = pd.read_sql(f'SELECT * FROM "{choose_table}" LIMIT 10', conn)
+                st.write('Top 10 строк таблицы:')
+                st.dataframe(preview)
+            except Exception as e:
+                st.warning(f'Ошибка предпросмотра: {e}')
+        if st.button('Подтвердить выбор таблицы'):
+            wizard['table'] = choose_table
+            wizard['table_confirmed'] = True
+            wizard['step'] = 1
+            st.success(f'Шаг 1 подтвержден: выбрана таблица {choose_table}')
+            st.rerun()
+
+    # 2. Планируемый placeholder под выбор колонки/агрегации (будет реализовано в следующих батчах)
+    with st.expander('📊 Шаг 2: Выберите колонку (будет после подтверждения таблицы)', expanded=(step == 1)):
+        if not wizard.get('table_confirmed'):
+            st.info('Сначала подтвердите таблицу.')
+        else:
+            st.info('В следующих шагах появится выбор колонок и предпросмотр значений.')
+    # TODO: шаги 3..N — аналогично
+
+    # reset wizard
+    if st.button('❌ Сбросить мастер (начать заново)'):
+        st.session_state['reset_wizard'] = True
+        st.rerun()
+
 # Основная область
 main_col1, main_col2 = st.columns([2, 1])
 
+if st.session_state.backend_choice == 'wizard_sql':
+    with main_col1:
+        wizard_sql()
+else:
+    # старый UX
 with main_col1:
     # Область ввода запроса
     st.header("💬 Аналитический запрос")
@@ -143,7 +215,7 @@ with main_col1:
     )
 
     # Кнопка отправки
-    submit_button = st.button("🚀 Анализировать", type="primary", use_container_width=True)
+        submit_button = st.button("🚀 Анализировать", type="primary")
 
 # Обработка запроса
 if submit_button and query_input:
@@ -159,8 +231,18 @@ if submit_button and query_input:
             }
 
             # Выполнение анализа
+            if backend_choice != "auto":
+                q_for_agent = f"{backend_choice}: {query_input}"
+            else:
+                q_for_agent = query_input
+            forced = st.session_state.get("backend_choice", "auto")
+            q_for_agent = query_input
+            if forced and forced != "auto":
+                # используем префикс, ReasoningAgent._decide_route обрабатывает "schema:" и др.
+                q_for_agent = f"{forced}: {query_input}"
+
             result = asyncio.run(st.session_state.digital_twin.process_query(
-                query=query_input,
+                query=q_for_agent,
                 session_id=st.session_state.current_session,
                 query_type=query_type_mapping[query_type]
             ))
@@ -226,8 +308,8 @@ if st.session_state.chat_history:
 
 
     # Вкладки для отображения различных аспектов результата
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Результаты", "🧠 Ход рассуждений", "💡 Инсайты", "🎯 Сценарии", "📈 Визуализация"
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 Результаты", "🧠 Ход рассуждений", "💡 Инсайты", "🎯 Сценарии", "📈 Визуализация", "🗄️ DB"
     ])
 
     with tab1:
@@ -260,14 +342,50 @@ if st.session_state.chat_history:
             st.subheader("📋 Данные")
             try:
                 df = pd.DataFrame(data_obj)
-                st.dataframe(df, use_container_width=True)
+                try:
+                    obj_cols = [c for c in df.columns if df[c].dtype == 'object']
+                    if obj_cols:
+                        df[obj_cols] = df[obj_cols].astype('string')
+                except Exception:
+                    pass
+                st.dataframe(df, width='stretch')
             except Exception:
                 # safety: convert to strings
                 df = pd.DataFrame(
                     [{k: str(v) for k, v in (r.items() if isinstance(r, dict) else [])} for r in data_obj])
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df, width='stretch')
         else:
             st.info("Данные отсутствуют.")
+
+        # Блок уточнений (если нужны)
+        validation = _get_field(latest_result, "validation_results") or {}
+        if validation.get("needs_clarification"):
+            st.warning("Требуются уточнения для завершения запроса.")
+            unknowns = validation.get("unknowns", [])
+            suggestions = validation.get("suggestions", {})
+            guesses = validation.get("guesses", {})
+            with st.expander("Показать детали неизвестных полей", expanded=True):
+                st.write("Неизвестные элементы:", ", ".join(unknowns))
+                if guesses:
+                    st.write("Предполагаемые колонки:")
+                    st.json(guesses)
+                if suggestions:
+                    st.write("Подсказки значений:")
+                    st.json(suggestions)
+            clar_text = st.text_input("Уточнение (пример: budget=cost или просто число)")
+            if st.button("💾 Сохранить уточнение и выполнить снова", type="primary"):
+                try:
+                    res2 = asyncio.run(st.session_state.digital_twin.clarify(st.session_state.current_session, clar_text))
+                    st.session_state.chat_history.append({
+                        "query": f"[clarify] {clar_text}",
+                        "type": "clarification",
+                        "result": res2,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    st.success("Уточнение применено.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ошибка применения уточнения: {e}")
 
         # --- Технические детали и доказательства (находится сразу после данных) ---
         with st.expander("🔍 Технические детали (SQL / Chroma / Evidence)", expanded=False):
@@ -480,6 +598,146 @@ if st.session_state.chat_history:
                     st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Нет данных для визуализации.")
+
+    with tab6:
+        st.header("🗄️ Обзор и загрузка базы данных (SQLite)")
+
+        st.markdown(
+            "Здесь вы можете просмотреть текущую SQLite базу (generated/digital_twin.db), "
+            "посмотреть таблицы/схему и загрузить CSV (overwrite или append)."
+        )
+
+        # Проверяем наличие файла БД
+        if not DB_PATH.exists():
+            st.warning(f"Файл БД не найден: {DB_PATH}. Пока нет таблиц для просмотра.")
+        else:
+            # engine / inspector
+            try:
+                engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
+                inspector = inspect(engine)
+                tables = inspector.get_table_names()
+            except Exception as e:
+                st.error(f"Ошибка подключения к базе: {e}")
+                tables = []
+
+            st.subheader("Список таблиц")
+            if tables:
+                selected_table = st.selectbox("Выберите таблицу для просмотра:", ["-- выбрать --"] + tables, index=0)
+                cols_viewer, rows_viewer = st.columns([1, 2])
+
+                with cols_viewer:
+                    if selected_table and selected_table != "-- выбрать --":
+                        st.write("Схема таблицы:")
+                        try:
+                            cols = inspector.get_columns(selected_table)
+                            schema_df = pd.DataFrame(
+                                [{"name": c["name"], "type": str(c.get("type", ""))} for c in cols])
+                            st.dataframe(schema_df, use_container_width=True, hide_index=True)
+                        except Exception as e:
+                            st.write("Ошибка чтения схемы:", e)
+
+                        # quick actions
+                        with st.expander("Дополнительно: Показать PRAGMA table_info", expanded=False):
+                            try:
+                                with engine.begin() as conn:
+                                    rows = conn.execute(text(f'PRAGMA table_info("{selected_table}")')).fetchall()
+                                    pr_df = pd.DataFrame([dict(r._mapping) for r in rows])
+                                    st.dataframe(pr_df, use_container_width=True)
+                            except Exception as e:
+                                st.write("Ошибка PRAGMA:", e)
+
+                with rows_viewer:
+                    if selected_table and selected_table != "-- выбрать --":
+                        limit = st.number_input("Показать строк (limit)", min_value=1, max_value=10000, value=100,
+                                                step=10)
+                        try:
+                            with engine.begin() as conn:
+                                q = text(f'SELECT * FROM "{selected_table}" LIMIT :limit')
+                                rows = conn.execute(q, {"limit": limit}).fetchall()
+                                if rows:
+                                    df = pd.DataFrame([dict(r._mapping) for r in rows])
+                                    st.dataframe(df, use_container_width=True)
+                                else:
+                                    st.info("Таблица пуста.")
+                        except Exception as e:
+                            st.write("Ошибка при чтении данных:", e)
+
+            else:
+                st.info("Таблиц не найдено в базе данных.")
+
+            st.markdown("---")
+            st.subheader("Загрузить CSV в базу данных")
+
+            with st.form("csv_loader_form"):
+                uploaded = st.file_uploader("Выберите CSV файл (UTF-8)", type=["csv"], accept_multiple_files=False)
+                table_name = st.text_input("Имя таблицы (куда загрузить):", value="my_table")
+                mode = st.radio("Режим загрузки:", options=["overwrite (replace table)", "append (to existing)"],
+                                index=0)
+                normalize_cols = st.checkbox("Нормализовать имена колонок (recommended)", value=True)
+                header_row = st.number_input("Номер строки с заголовком (0-based)", min_value=0, value=0)
+                submit_csv = st.form_submit_button("Загрузить CSV")
+
+                if submit_csv:
+                    if not uploaded:
+                        st.warning("Пожалуйста, выберите CSV файл.")
+                    else:
+                        # backup DB before overwrite
+                        backup_needed = mode.startswith("overwrite")
+                        if backup_needed and DB_PATH.exists():
+                            bak = DB_PATH.with_suffix(
+                                DB_PATH.suffix + f".bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                            try:
+                                import shutil
+
+                                shutil.copy2(DB_PATH, bak)
+                                st.info(f"Бэкап БД создан: {bak.name}")
+                            except Exception as e:
+                                st.warning(f"Не удалось создать бэкап: {e}")
+
+                        try:
+                            # read CSV (attempt encoding auto-detect)
+                            import chardet, io
+
+                            raw = uploaded.read()
+                            enc = chardet.detect(raw).get("encoding") or "utf-8"
+                            df = pd.read_csv(io.BytesIO(raw), encoding=enc, header=header_row)
+                            st.write(
+                                f"Файл прочитан (encoding={enc}). Размер: {len(df)} строк, {len(df.columns)} колонок.")
+                        except Exception as e:
+                            st.error(f"Ошибка чтения CSV: {e}")
+                            df = None
+
+                        if df is not None:
+                            # Optional normalize column names using existing util if available
+                            try:
+                                from agent.utils.column_normalizer import normalize_dataframe_columns
+
+                                if normalize_cols:
+                                    df = normalize_dataframe_columns(df)
+                                    st.write("Имена колонок нормализованы.")
+                            except Exception:
+                                # fallback: simple normalization
+                                if normalize_cols:
+                                    df.columns = [re.sub(r'[^\w]', '_', str(c)).strip('_') or f"col_{i}" for i, c in
+                                                  enumerate(df.columns)]
+                                    st.write("Имена колонок простыми правилами нормализованы (fallback).")
+
+                            # Write to SQL (pandas.to_sql)
+                            try:
+                                if mode.startswith("overwrite"):
+                                    if_exists = "replace"
+                                else:
+                                    if_exists = "append"
+                                # Ensure DB dir exists
+                                DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                                engine_local = create_engine(f"sqlite:///{DB_PATH}", future=True)
+                                # write
+                                df.to_sql(table_name, con=engine_local, if_exists=if_exists, index=False)
+                                st.success(f"CSV успешно загружен в таблицу '{table_name}' (mode={if_exists}).")
+                                # refresh inspect / tables
+                                st.experimental_rerun()
+                            except Exception as e:
+                                st.error(f"Ошибка при записи в БД: {e}")
 
 # История запросов
 with main_col2:

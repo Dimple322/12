@@ -34,7 +34,7 @@ def index_documents(texts: List[str], metas: List[Dict[str, str]]):
     db_path.mkdir(parents=True, exist_ok=True)
 
     client = chromadb.PersistentClient(path=str(db_path))
-    coll = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+    coll = client.get_or_create_collection("documents", metadata={"hnsw:space": "cosine"})
 
     if ENCODER is None:
         print("⚠️ ENCODER не инициализирован, индексация пропущена.")
